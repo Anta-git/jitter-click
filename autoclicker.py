@@ -2,11 +2,20 @@
 
 Two modes:
     Anchor    - click repeatedly around one point.
-    Sequence  - record a series of steps, then replay them in a loop. A step is a click at a
-                recorded point (a shift-click if Shift was held), a color step (find that color on screen, move to it, click),
-                a key step (a key, a combo like Ctrl+S, or a run of typed keys), or a wait
-                (a set time ± jitter, used instead of the normal delay between steps).
-                Sequences and settings can be saved to / loaded from a .json file.
+    Sequence  - play the "Main" sequence in a loop. A step is a click at a recorded point
+                (a shift-click if Shift was held), a color step (find that color on screen, move
+                to it, click), a key step (a key, a combo like Ctrl+S, or a run of typed keys),
+                a wait (a set time ± jitter, used instead of the normal delay between steps), or
+                a "run" step that plays another named sequence (a sub-sequence). Any step can
+                repeat a set number of times, so "run Loot ×5" plays the Loot sub-sequence five
+                times. Sub-sequences can run other sub-sequences, but never themselves.
+                Sequences, idle areas and settings can be saved to / loaded from a .json file.
+
+Idle areas (own tab): spots the cursor wanders to when there's free time (delays between steps,
+wait steps, optionally breaks). It picks one at random, travels there (first clicking the
+area's click spot, if it has one), and slowly drifts around inside its hover radius. Idling is strictly lower
+priority than the steps: it only starts if there's time to get there, hover a while, and still
+make it back for the next step on schedule.
 
 The cursor glides to each click point along a curved, eased path (with the occasional
 overshoot-and-correct) instead of jumping there. Keys are held for a varying time, spaced by a
@@ -17,7 +26,7 @@ near the setting and extremes are rare.
 Hotkeys (global, and not passed on to the focused app):
     F6   start / stop
     F7   start / stop recording (your clicks and key presses on other windows become steps)
-    F8   set the anchor to the current mouse position
+    F8   set the anchor to the current mouse position (on the Idle areas tab: add an idle area there)
     F9   add a color step using the color under the cursor
     F10  pause / resume (resumes the step it paused on; the mouse is yours while paused)
 """
@@ -71,6 +80,8 @@ VK_F8 = 0x77
 VK_F9 = 0x78
 VK_F10 = 0x79
 HOTKEYS = (VK_F6, VK_F7, VK_F8, VK_F9, VK_F10)
+MAIN = "Main"        # the sequence that plays; every other sequence is a sub-sequence
+MAX_DEPTH = 16       # deepest nesting of sub-sequences played
 
 MODIFIERS = {0xA0: "Shift", 0xA1: "Shift", 0xA2: "Ctrl", 0xA3: "Ctrl",
              0xA4: "Alt", 0xA5: "Alt", 0x5B: "Win", 0x5C: "Win"}
@@ -108,6 +119,15 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", ctypes.c_ulong), ("u", _U)]
 
 
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+
+
 class BITMAPINFOHEADER(ctypes.Structure):
     _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
                 ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16),
@@ -125,6 +145,7 @@ user32.GetAncestor.argtypes = [_H, ctypes.c_uint]
 user32.GetAncestor.restype = _H
 user32.MonitorFromPoint.argtypes = [POINT, ctypes.c_uint]
 user32.MonitorFromPoint.restype = _H
+user32.GetMonitorInfoW.argtypes = [_H, ctypes.c_void_p]
 user32.GetDC.argtypes = [_H]
 user32.GetDC.restype = _H
 user32.ReleaseDC.argtypes = [_H, _H]
@@ -158,6 +179,18 @@ def virtual_screen():
 
 def on_screen(x, y):
     return bool(user32.MonitorFromPoint(POINT(int(x), int(y)), 0))  # 0 = MONITOR_DEFAULTTONULL
+
+
+def clamp_to_screen(x, y):
+    """Nearest point to (x, y) that's on a monitor. Windows pins the cursor to the screen, so
+    aiming past an edge would leave it somewhere other than where we think it is."""
+    if on_screen(x, y):
+        return x, y
+    mon = user32.MonitorFromPoint(POINT(int(x), int(y)), 2)  # 2 = MONITOR_DEFAULTTONEAREST
+    mi = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    user32.GetMonitorInfoW(mon, ctypes.byref(mi))
+    r = mi.rcMonitor
+    return min(max(x, r.left), r.right - 1), min(max(y, r.top), r.bottom - 1)
 
 
 def send_mouse(flags, dx=0, dy=0):
@@ -315,6 +348,38 @@ def movement_time(dist, speed_pct, speed_jitter_pct):
     return t * 100 / max(10, speed_pct)
 
 
+def max_movement_time(dist, speed_pct, speed_jitter_pct):
+    """Upper bound on how long movement_time() can make a move of `dist` px."""
+    if dist < 1:
+        return 0.0
+    return ((0.05 + 0.11 * math.log2(dist / 14 + 1)) * (1 + min(speed_jitter_pct, 90) / 100)
+            * 100 / max(10, speed_pct)) + 0.02
+
+
+def point_in_circle(cx, cy, r):
+    """Uniformly random integer point within radius r of (cx, cy)."""
+    if r <= 0:
+        return cx, cy
+    while True:
+        dx, dy = random.randint(-r, r), random.randint(-r, r)
+        if dx * dx + dy * dy <= r * r:
+            return cx + dx, cy + dy
+
+
+def point_in_zone(cx, cy, r, near=None, hop=None):
+    """Random on-screen point within radius r of (cx, cy), preferring one within `hop` px of
+    `near`. Parts of a zone hanging off the screen edge are never picked."""
+    fallback = None
+    for _ in range(40):
+        p = point_in_circle(cx, cy, r)
+        if not on_screen(*p):
+            continue
+        if near is None or math.hypot(p[0] - near[0], p[1] - near[1]) <= hop:
+            return p
+        fallback = fallback or p
+    return fallback or clamp_to_screen(cx, cy)
+
+
 def curved_path(x0, y0, x1, y1, curve_pct):
     """Cubic Bezier from start to end that bows to one side by up to ±curve_pct of the distance.
 
@@ -426,18 +491,56 @@ def parse_step(st):
         step = {"type": "click", "x": int(st["x"]), "y": int(st["y"])}
         if st.get("shift"):
             step["shift"] = True
-        return step
-    if kind == "color":
+    elif kind == "color":
         r, g, b = (int(c) for c in st["rgb"])
-        return {"type": "color", "x": int(st["x"]), "y": int(st["y"]), "rgb": (r, g, b)}
-    if kind == "keys":
+        step = {"type": "color", "x": int(st["x"]), "y": int(st["y"]), "rgb": (r, g, b)}
+    elif kind == "keys":
         keys = tuple((tuple(int(m) for m in mods), int(vk)) for mods, vk in st["keys"])
         if not keys or any(m not in MODIFIERS for mods, _ in keys for m in mods):
             raise ValueError("bad key step")
-        return {"type": "keys", "keys": keys}
-    if kind == "wait":
-        return {"type": "wait", "ms": max(0, int(st["ms"])), "jitter": max(0, int(st["jitter"]))}
-    raise ValueError(f"unknown step type {kind!r}")
+        step = {"type": "keys", "keys": keys}
+    elif kind == "wait":
+        step = {"type": "wait", "ms": max(0, int(st["ms"])), "jitter": max(0, int(st["jitter"]))}
+    elif kind == "call":
+        step = {"type": "call", "seq": str(st["seq"])}
+    else:
+        raise ValueError(f"unknown step type {kind!r}")
+    times = int(st.get("times", 1))
+    if times < 1:
+        raise ValueError("repeat count must be at least 1")
+    if times > 1:
+        step["times"] = times
+    return step
+
+
+def runs_into(sequences, start, target):
+    """True if sequence `start` is `target` or runs it, directly or through other sub-sequences.
+    Used to refuse 'run' steps that would make a sequence end up running itself."""
+    seen, todo = set(), [start]
+    while todo:
+        name = todo.pop()
+        if name == target:
+            return True
+        if name in seen:
+            continue
+        seen.add(name)
+        todo += [st["seq"] for st in sequences.get(name, ()) if st["type"] == "call"]
+    return False
+
+
+def parse_idle_area(a):
+    """Idle area from JSON. "click" is the [x, y] clicked before idling, or null; files from
+    before click spots were separate stored true, meaning click the idle spot itself."""
+    x, y = int(a["x"]), int(a["y"])
+    click = a.get("click")
+    if click is True:
+        click = (x, y)
+    elif click:
+        cx, cy = (int(v) for v in click)
+        click = (cx, cy)
+    else:
+        click = None
+    return {"x": x, "y": y, "radius": max(0, int(a["radius"])), "click": click}
 
 
 class Hotkeys(threading.Thread):
@@ -476,8 +579,10 @@ class Clicker:
         self.clicks = 0
         self.keys = 0
         self.paused = False
-        self.current_step = None     # index of the sequence step in progress
+        self.stack = ()              # ((sequence, step index), ...) from Main down to the step playing
+        self.current_idle = None     # index of the idle area being hovered
         self.last_pos = (0, 0)       # where we last left the cursor
+        self.step_pos = (0, 0)       # where the last step (not idling) left the cursor
         self.user_moved = False
         self._stop = threading.Event()
         self._thread = None
@@ -504,31 +609,62 @@ class Clicker:
             self._loop()
         finally:
             winmm.timeEndPeriod(1)
-            self.current_step = None
+            self.stack = ()
             self.paused = False
-            self.status = "Stopped (you moved the mouse)" if self.user_moved else "Stopped"
+            if self.user_moved:
+                self.status = "Stopped (you moved the mouse)"
+            elif not self.status.startswith("Stopped"):
+                self.status = "Stopped"
 
     def _loop(self):
-        self.last_pos = cursor_pos()
+        self.last_pos = self.step_pos = cursor_pos()
         next_action = time.perf_counter()
-        step = 0
+        # Play position as a stack of [sequence, step index, repetitions done], Main at the
+        # bottom. A "run" step pushes the sub-sequence; finishing it pops back and counts one
+        # repetition of that run step.
+        stack = []
+        played = False  # whether this pass through Main did anything
         while not self._stop.is_set():
             s = self.settings
             is_wait = False
             try:
                 if s["mode"] != "sequence":
-                    self.current_step = None
+                    self.stack = ()
                     self.status = "Clicking"
                     done = self._move_and_click(point_in_radius(s["x"], s["y"], s["radius"]),
-                                                next_action)
+                                                next_action, why="next: click")
                 else:
-                    steps = s["steps"]
-                    if not steps:
-                        break
-                    step %= len(steps)
-                    self.current_step = step
-                    is_wait = steps[step]["type"] == "wait"
-                    done = self._run_step(steps[step], f"step {step + 1}/{len(steps)}", next_action)
+                    seqs = s["sequences"]
+                    if not stack:
+                        stack.append([MAIN, 0, 0])
+                    frame = stack[-1]
+                    steps = seqs.get(frame[0], ())
+                    if frame[1] >= len(steps):  # reached the end of this sequence
+                        stack.pop()
+                        if stack:
+                            stack[-1][2] += 1
+                        elif not played:
+                            self.status = "Stopped: nothing to play (the sequences have no steps)"
+                            break
+                        else:
+                            played = False  # Main starts over
+                        continue
+                    st = steps[frame[1]]
+                    if frame[2] >= st.get("times", 1):
+                        frame[1] += 1
+                        frame[2] = 0
+                        continue
+                    if st["type"] == "call":
+                        if (st["seq"] not in seqs or len(stack) >= MAX_DEPTH
+                                or any(f[0] == st["seq"] for f in stack)):
+                            frame[2] = st.get("times", 1)  # missing or would run itself: skip
+                        else:
+                            stack.append([st["seq"], 0, 0])
+                        continue
+                    self.stack = tuple((name, idx) for name, idx, _ in stack)
+                    is_wait = st["type"] == "wait"
+                    done = self._run_step(st, self._path(stack, seqs), next_action)
+                    played = True
             except _Paused:
                 if self._hold_while_paused() is None:
                     break
@@ -536,7 +672,8 @@ class Clicker:
                 continue  # redo the same step
             if done is None:
                 break
-            step += 1
+            if stack:
+                stack[-1][2] += 1
             if done is False:
                 continue  # step skipped
             if is_wait:
@@ -547,13 +684,26 @@ class Clicker:
             if s["breaks"] and random.random() * 100 < s["break_chance"]:
                 dur = human_delay(s["break_ms"], s["break_jitter"])
                 self.status = f"On break ({dur:.1f}s)"
+                end = time.perf_counter() + dur
                 try:
-                    if not self._wait(dur):
+                    if not (self._idle(end, "breaks", why="on break")
+                            and self._wait(end - time.perf_counter())):
                         break
                 except _Paused:
                     if self._hold_while_paused() is None:  # resuming ends the break
                         break
                 next_action = time.perf_counter()
+
+    @staticmethod
+    def _path(stack, seqs):
+        """Where we are, for the status line: 'Main 2 › Loot 3 [2/5]' (step numbers from 1,
+        [repetition/total] for steps that repeat)."""
+        parts = []
+        for name, idx, rep in stack:
+            steps = seqs.get(name, ())
+            times = steps[idx].get("times", 1) if idx < len(steps) else 1
+            parts.append(f"{name} {idx + 1}" + (f" [{rep + 1}/{times}]" if times > 1 else ""))
+        return " › ".join(parts)
 
     def _run_step(self, st, label, next_action):
         """Run one sequence step. Returns when it finished, False if skipped, None if stopped."""
@@ -562,6 +712,15 @@ class Clicker:
             return self._wait_step(st, label)
         if st["type"] == "keys":
             self.status = f"Typing ({label})"
+            # Keys may depend on what's hovered, so after idling (here or in a wait step before
+            # this), go back to where the last click step left the cursor.
+            home = self.step_pos
+            if not self._idle(next_action, "delays", home, f"next: {label}"):
+                return None
+            if cursor_pos() != home:
+                x0, y0 = cursor_pos()
+                if not self._move_to(*home, self._move_time(math.hypot(home[0] - x0, home[1] - y0))):
+                    return None
             if not (self._wait(next_action - time.perf_counter()) and self._type(st["keys"])):
                 return None
             return time.perf_counter()
@@ -569,6 +728,8 @@ class Clicker:
             # Search right before we'd start moving, so the position is fresh.
             x0, y0 = cursor_pos()
             lead = self._move_time(math.hypot(st["x"] - x0, st["y"] - y0)) + 0.08
+            if not self._idle(next_action - lead, "delays", (st["x"], st["y"]), f"next: {label}"):
+                return None
             if not self._wait(next_action - lead - time.perf_counter()):
                 return None
             self.status = f"Looking for {color_hex(st['rgb'])} ({label})"
@@ -576,22 +737,29 @@ class Clicker:
             if target is None:
                 return None if self._stop.is_set() else False
             self.status = f"Clicking ({label})"
-            return self._move_and_click(target, next_action)
+            return self._move_and_click(target, next_action, why=f"next: {label}")
         shift = st.get("shift", False)
         self.status = f"{'Shift-clicking' if shift else 'Clicking'} ({label})"
-        return self._move_and_click(point_in_radius(st["x"], st["y"], s["radius"]), next_action, shift)
+        return self._move_and_click(point_in_radius(st["x"], st["y"], s["radius"]), next_action, shift,
+                                    why=f"next: {label}")
 
     def _wait_step(self, st, label):
-        """Idle for the step's time ± jitter, counting down in the status. A pause freezes the
-        countdown; resuming continues with the time that was left. Returns the end time, or
-        None if stopped."""
+        """Wait for the step's time ± jitter (hovering at an idle area if enabled), counting
+        down in the status. A pause freezes the countdown; resuming continues with the time
+        that was left. Returns the end time, or None if stopped."""
         end = time.perf_counter() + human_delay(st["ms"], st["jitter"], 0)
+        try_idle = True
         while True:
             left = end - time.perf_counter()
             if left <= 0:
                 return time.perf_counter()
-            self.status = f"Waiting {left:.1f}s ({label})"
             try:
+                if try_idle:
+                    try_idle = False
+                    if not self._idle(end, "waits", why=label):
+                        return None
+                    continue
+                self.status = f"Waiting {left:.1f}s ({label})"
                 if not self._wait(min(left, 0.1)):
                     return None
             except _Paused:
@@ -599,6 +767,7 @@ class Clicker:
                 if paused_for is None:
                     return None
                 end += paused_for
+                try_idle = True
 
     def _hold_while_paused(self):
         """Block while paused. Returns the seconds spent paused, or None if stopped meanwhile."""
@@ -612,14 +781,17 @@ class Clicker:
         self.last_pos = cursor_pos()  # the mouse was yours while paused; don't count that as a move
         return time.perf_counter() - start
 
-    def _move_and_click(self, target, press_at, shift=False):
+    def _move_and_click(self, target, press_at, shift=False, why=""):
         """Glide to target and click (holding Shift if `shift`), timed so the press lands at
-        press_at when possible. Returns the press time, or None if stopped."""
-        tx, ty = target
-        x0, y0 = cursor_pos()
-        move_t = self._move_time(math.hypot(tx - x0, ty - y0))
+        press_at when possible. Free time beforehand may be spent at an idle area.
+        Returns the press time, or None if stopped."""
+        tx, ty = target = clamp_to_screen(*target)
         settle = random.uniform(0.04, 0.12)  # brief pause on target before pressing
         lead = random.uniform(0.05, 0.15) if shift else 0.0  # Shift goes down this long before the press
+        if not self._idle(press_at - settle - lead, "delays", target, why):
+            return None
+        x0, y0 = cursor_pos()
+        move_t = self._move_time(math.hypot(tx - x0, ty - y0))
 
         # Clicking faster than a natural move allows: hurry the move to keep the interval.
         budget = press_at - time.perf_counter()
@@ -631,6 +803,7 @@ class Clicker:
             return None
         if not self._move_to(tx, ty, move_t):
             return None
+        self.step_pos = self.last_pos
         if not self._wait(settle):
             return None
         shift_down = False
@@ -677,6 +850,77 @@ class Clicker:
         finally:
             for vk in held:
                 send_key(vk, up=True)  # never leave a key stuck down
+
+    def _idle(self, until, kind, next_target=None, why=""):
+        """Spend free time until `until` hovering around a random idle area.
+
+        Low priority: it only goes if there's time to get there, hover for at least the minimum
+        idle time, and still reach next_target (if given) by `until`, using a worst-case move
+        time for the trip back. `kind` ("delays", "waits" or "breaks") is checked against the
+        "idle during" settings. Returns False if stopped, True otherwise (including when it
+        didn't idle); a pause raises _Paused like everywhere else.
+        """
+        s = self.settings
+        areas = s.get("idle_areas")
+        if not (areas and s["idle"] and s[f"idle_in_{kind}"]):
+            return True
+        i = random.randrange(len(areas))
+        area = areas[i]
+        ax, ay, r = area["x"], area["y"], area["radius"]
+        entry = point_in_zone(ax, ay, r)
+
+        def longest(a, b):
+            return max_movement_time(math.hypot(b[0] - a[0], b[1] - a[1]), s["speed"], s["speed_jitter"])
+
+        reserve = 0.0
+        if next_target:  # worst case: heading back from the far edge of the hover zone
+            reserve = max_movement_time(math.dist((ax, ay), next_target) + r,
+                                        s["speed"], s["speed_jitter"]) + 0.05
+        here = cursor_pos()
+        if area["click"]:
+            # Click at the area's click spot first, then go and idle around its idle spot.
+            click_at = clamp_to_screen(*point_in_radius(*area["click"], s["radius"]))
+            trip = longest(here, click_at) + 0.35 + longest(click_at, entry)
+        else:
+            click_at = None
+            trip = longest(here, entry)
+        stop_at = until - reserve
+        if stop_at - time.perf_counter() < trip + s["idle_min"] / 1000:
+            return True
+
+        status = self.status
+        self.current_idle = i
+        self.status = f"Idling at area {i + 1}" + (f" · {why}" if why else "")
+        try:
+            if click_at:
+                if not (self._move_to(*click_at, self._move_time(math.dist(here, click_at)))
+                        and self._wait(random.uniform(0.05, 0.15))):
+                    return False
+                self._click()
+                self.clicks += 1
+                if not self._wait(random.uniform(0.1, 0.3)):  # a beat before moving off
+                    return False
+            here = cursor_pos()
+            if not self._move_to(*entry, self._move_time(math.dist(here, entry))):
+                return False
+            while True:
+                pause = human_delay(s["drift_pause"], s["drift_pause_jitter"], 50)
+                if time.perf_counter() + pause >= stop_at:
+                    return self._wait(stop_at - time.perf_counter())
+                if not self._wait(pause):
+                    return False
+                # Drift a short hop to another on-screen spot inside the hover zone.
+                cx, cy = cursor_pos()
+                nx, ny = point_in_zone(ax, ay, r, near=(cx, cy), hop=max(4, r * 0.6))
+                drift_t = movement_time(math.hypot(nx - cx, ny - cy),
+                                        s["speed"] * s["drift_speed"] / 100, s["speed_jitter"])
+                if time.perf_counter() + drift_t >= stop_at:
+                    return self._wait(stop_at - time.perf_counter())
+                if not self._glide(nx, ny, drift_t):
+                    return False
+        finally:
+            self.current_idle = None
+            self.status = status
 
     def _find_color(self, st, s):
         """Search for a color step's color, retrying until it appears or the timeout passes."""
@@ -726,21 +970,24 @@ class Clicker:
     def _move_to(self, tx, ty, duration):
         x0, y0 = cursor_pos()
         dist = math.hypot(tx - x0, ty - y0)
-        if dist > 120 and random.random() < 0.25:
-            # Overshoot slightly past the target, then make a small correction.
+        if dist > 120 and duration >= 0.25 and random.random() < 0.25:
+            # Overshoot slightly past the target, then make a small correction, all within the
+            # planned duration so the click still lands on time.
             over = dist * random.uniform(0.02, 0.07)
             ox = round(tx + (tx - x0) / dist * over + random.gauss(0, 2))
             oy = round(ty + (ty - y0) / dist * over + random.gauss(0, 2))
             if on_screen(ox, oy):
-                if not self._glide(ox, oy, duration * 0.85):
+                end = time.perf_counter() + duration
+                if not self._glide(ox, oy, duration * random.uniform(0.7, 0.8)):
                     return False
-                if not self._wait(random.uniform(0.03, 0.09)):
+                if not self._wait(min(random.uniform(0.03, 0.09), duration * 0.1)):
                     return False
-                duration = self._move_time(math.hypot(tx - ox, ty - oy))
+                duration = max(0.04, end - time.perf_counter())
         return self._glide(tx, ty, duration)
 
     def _glide(self, tx, ty, duration):
         """Move from the current position to (tx, ty) over `duration` s. False if stopped."""
+        tx, ty = clamp_to_screen(tx, ty)
         x0, y0 = cursor_pos()
         if math.hypot(tx - x0, ty - y0) >= 1 and duration > 0:
             path, (nx, ny) = curved_path(x0, y0, tx, ty, self.settings["curve"])
@@ -773,7 +1020,76 @@ class Clicker:
         return True
 
 
+class Tooltip:
+    """Small help box shown when the mouse rests on a widget."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._after = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event):
+        self._hide()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        self._after = None
+        tip = self._tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=self.text, justify="left", wraplength=300, background="#ffffe1",
+                 relief="solid", borderwidth=1, padx=6, pady=4).pack()
+        tip.update_idletasks()
+        # Below the widget, kept on screen.
+        left, top, w, h = virtual_screen()
+        x = min(self.widget.winfo_rootx() + 10, left + w - tip.winfo_width() - 4)
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        if y + tip.winfo_height() > top + h:
+            y = self.widget.winfo_rooty() - tip.winfo_height() - 4
+        tip.wm_geometry(f"+{x}+{y}")
+
+    def _hide(self, _event=None):
+        if self._after:
+            self.widget.after_cancel(self._after)
+            self._after = None
+        if self._tip:
+            self._tip.destroy()
+            self._tip = None
+
+
 class App:
+    TIPS = {
+        "x": "Anchor point for 'Click around anchor' mode. Hover where you want it and press F8.",
+        "y": "Anchor point for 'Click around anchor' mode. Hover where you want it and press F8.",
+        "radius": "Clicks land within this many pixels of their target, mostly near the middle. "
+                  "Also applies to color steps and idle-area clicks.",
+        "interval": "Time from one step to the next (press to press, for clicks).",
+        "interval_jitter": "Random ± change to each delay between steps. Most land near the "
+                           "setting, never outside the range.",
+        "key_hold": "How long each key is held down.",
+        "key_hold_jitter": "Random ± change to each key's hold time.",
+        "key_delay": "Time from one key press to the next inside a key step. Shorter than the "
+                     "hold time means keys overlap, like fast typing.",
+        "key_delay_jitter": "Random ± change to the time between keys.",
+        "speed": "Overall mouse speed. 200 moves twice as fast, 50 half as fast.",
+        "speed_jitter": "How much each move's speed varies, ± %.",
+        "curve": "How far paths bow to one side, as ± % of the move's length. 0 = straight lines.",
+        "tolerance": "How far each of red, green and blue may differ from the recorded color and "
+                     "still count as a match.",
+        "search_radius": "Only search this far around where the color was picked. 0 searches every screen.",
+        "color_timeout": "If the color isn't on screen, keep looking this long, then skip the step.",
+        "break_chance": "Chance of a break after each click or key step.",
+        "break_ms": "How long a break lasts.",
+        "break_jitter": "Random ± change to each break's length.",
+        "idle_min": "Only go idle if the cursor can hover at least this long before it has to "
+                    "head back for the next step.",
+        "drift_speed": "Speed of the slow drifting moves while idling, as % of the normal move speed.",
+        "drift_pause": "Time spent still between drifting moves.",
+        "drift_pause_jitter": "Random ± change to each pause between drifts.",
+    }
     GROUPS = [
         # title, grid row, grid column, fields: (key, label, default)
         ("Clicking", 1, 0, [
@@ -805,7 +1121,13 @@ class App:
             ("break_jitter", "Break jitter ± (ms)", 3000),
         ]),
     ]
-    FIELDS = [f for group in GROUPS for f in group[3]]
+    IDLE_FIELDS = [
+        ("idle_min", "Min hover time (ms)", 1500),
+        ("drift_speed", "Drift speed (%)", 35),
+        ("drift_pause", "Pause between drifts (ms)", 900),
+        ("drift_pause_jitter", "Drift pause jitter ± (ms)", 600),
+    ]
+    FIELDS = [f for group in GROUPS for f in group[3]] + IDLE_FIELDS
     CURRENT_BG = "#cfe3ff"
 
     def __init__(self, root):
@@ -813,10 +1135,14 @@ class App:
         self.clicker = Clicker()
         self.hotkeys = Hotkeys(HOTKEYS)
         self.vars = {}
+        self.bool_vars = {}
         self.steps = []              # recorded sequence; see add_step() callers for the shapes
+        self.idle_areas = []         # {"x", "y", "radius", "click"}
         self.recording = False
         self.note, self.note_until = "", 0.0   # temporary message for the status line
         self._shown_step = None      # step index currently highlighted in the list
+        self._shown_idle = None      # idle area currently highlighted
+        self._pending_click = None   # click spot captured by the first F8 of a two-press area
         self._keys_down = set()      # edge detection for polled keys
         self._rec_down = set()       # keys down at the last recording poll
         self._mod_unused = {}        # modifiers held with no other key pressed yet
@@ -827,85 +1153,209 @@ class App:
         root.resizable(False, False)
         frm = ttk.Frame(root, padding=10)
         frm.grid()
-        left = ttk.Frame(frm)
+        self.notebook = ttk.Notebook(frm)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        seq_tab = ttk.Frame(self.notebook, padding=8)
+        idle_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(seq_tab, text="Sequence")
+        self.notebook.add(idle_tab, text="Idle areas")
+        left = ttk.Frame(seq_tab)
         left.grid(row=0, column=0, sticky="n")
-        right = ttk.LabelFrame(frm, text="Recorded sequence", padding=6)
+        right = ttk.LabelFrame(seq_tab, text="Recorded sequence", padding=6)
         right.grid(row=0, column=1, sticky="ns", padx=(10, 0))
 
         self.mode_var = tk.StringVar(value="anchor")
         modes = ttk.Frame(left)
         modes.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        ttk.Radiobutton(modes, text="Click around anchor", variable=self.mode_var,
-                        value="anchor").grid(row=0, column=0, padx=(0, 12))
-        ttk.Radiobutton(modes, text="Repeat recorded sequence", variable=self.mode_var,
-                        value="sequence").grid(row=0, column=1)
+        w = ttk.Radiobutton(modes, text="Click around anchor", variable=self.mode_var, value="anchor")
+        w.grid(row=0, column=0, padx=(0, 12))
+        self._tip("Click over and over around the anchor point.", w)
+        w = ttk.Radiobutton(modes, text="Repeat recorded sequence", variable=self.mode_var, value="sequence")
+        w.grid(row=0, column=1)
+        self._tip("Play the recorded steps on the right in a loop.", w)
 
         groups = {}
         for title, grow, gcol, fields in self.GROUPS:
             box = ttk.LabelFrame(left, text=title, padding=(8, 4))
             box.grid(row=grow, column=gcol, sticky="nsew", padx=3, pady=3)
-            box.columnconfigure(0, weight=1)
-            for row, (key, label, default) in enumerate(fields):
-                ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", pady=2)
-                var = tk.StringVar(value=str(default))
-                ttk.Entry(box, textvariable=var, width=8).grid(row=row, column=1, pady=2, padx=(6, 0))
-                self.vars[key] = var
+            self._field_rows(box, fields)
             groups[title] = box
 
-        self.breaks_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(groups["Breaks"], text="Take random breaks", variable=self.breaks_var).grid(
-            row=len(self.GROUPS[-1][3]), column=0, columnspan=2, sticky="w", pady=(2, 0))
+        w = ttk.Checkbutton(groups["Breaks"], text="Take random breaks", variable=self._bool("breaks", True))
+        w.grid(row=len(self.GROUPS[-1][3]), column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._tip("Now and then, stop for a while: no clicks, keys or mouse movement "
+                  "(unless idling during breaks is on in the Idle areas tab).", w)
 
         controls = ttk.Frame(left, padding=(8, 4))
         controls.grid(row=3, column=1, sticky="nsew", padx=3, pady=3)
         controls.columnconfigure((0, 1), weight=1)
-        self.stop_on_move_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(controls, text="Stop if I move the mouse", variable=self.stop_on_move_var).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(4, 8))
+        w = ttk.Checkbutton(controls, text="Stop if I move the mouse", variable=self._bool("stop_on_move", True))
+        w.grid(row=0, column=0, columnspan=2, sticky="w", pady=(4, 8))
+        self._tip("Stop automatically if you take over the mouse (it's more than 3 px from where "
+                  "it was left). Doesn't apply while paused.", w)
         self.toggle_btn = ttk.Button(controls, text="Start (F6)", command=self.toggle)
         self.toggle_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        self._tip("Start or stop (F6). Starting again begins from step 1.", self.toggle_btn)
         self.pause_btn = ttk.Button(controls, text="Pause (F10)", command=self.toggle_pause)
         self.pause_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0))
-        ttk.Button(controls, text="Set anchor (F8)", command=self.set_anchor).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._tip("Pause or resume (F10). Resumes the step it paused on; the mouse is yours "
+                  "while paused.", self.pause_btn)
+        w = ttk.Button(controls, text="Set anchor (F8)", command=self.set_anchor)
+        w.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self._tip("Set the anchor to the mouse position. Hover where you want it and press F8.", w)
 
-        self.listbox = tk.Listbox(right, height=14, width=32, activestyle="none",
+        self.listbox = tk.Listbox(right, height=16, width=32, activestyle="none",
                                   selectmode="extended")
         self.listbox.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self._tip("The steps, in order. ▶ marks the one in progress. Drag a step to move it. "
+                  "Select steps to move, remove, or insert a wait after them (Shift/Ctrl-click "
+                  "selects several).", self.listbox)
+        self._drag_from = None
+        self.listbox.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.listbox.bind("<B1-Motion>", self._drag_motion)
+        self.listbox.bind("<ButtonRelease-1>", self._drag_end, add="+")
+        self.listbox.bind("<Control-Up>", lambda e: self.move_selected(-1) or "break")
+        self.listbox.bind("<Control-Down>", lambda e: self.move_selected(1) or "break")
         self.record_btn = ttk.Button(right, text="Record (F7)", command=self.toggle_record)
         self.record_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        self._tip("Start or stop recording (F7). Your clicks (and shift-clicks) and key presses on "
+                  "other windows become steps. F9 adds a color step from the pixel under the cursor, "
+                  "recording or not.", self.record_btn)
         wait_row = ttk.Frame(right)
         wait_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 2))
         wait_row.columnconfigure(4, weight=1)
         self.wait_ms_var = tk.StringVar(value="2000")
         self.wait_jitter_var = tk.StringVar(value="500")
-        ttk.Entry(wait_row, textvariable=self.wait_ms_var, width=6).grid(row=0, column=0)
+        w = ttk.Entry(wait_row, textvariable=self.wait_ms_var, width=6)
+        w.grid(row=0, column=0)
+        self._tip("Length of the wait to add (ms).", w)
         ttk.Label(wait_row, text="±").grid(row=0, column=1, padx=2)
-        ttk.Entry(wait_row, textvariable=self.wait_jitter_var, width=5).grid(row=0, column=2)
+        w = ttk.Entry(wait_row, textvariable=self.wait_jitter_var, width=5)
+        w.grid(row=0, column=2)
+        self._tip("Random ± change to the wait each time it plays (ms).", w)
         ttk.Label(wait_row, text="ms").grid(row=0, column=3, padx=(2, 4))
-        ttk.Button(wait_row, text="Add wait", command=self.add_wait).grid(row=0, column=4, sticky="ew")
-        ttk.Button(right, text="Remove", command=self.remove_selected).grid(
-            row=3, column=0, sticky="ew", padx=(0, 2), pady=(0, 2))
-        ttk.Button(right, text="Clear", command=self.clear_steps).grid(
-            row=3, column=1, sticky="ew", padx=(2, 0), pady=(0, 2))
-        ttk.Button(right, text="Save…", command=self.save).grid(
-            row=4, column=0, sticky="ew", padx=(0, 2))
-        ttk.Button(right, text="Load…", command=self.load).grid(
-            row=4, column=1, sticky="ew", padx=(2, 0))
-        ttk.Label(right, text="While recording, your clicks and key\npresses on other windows become\n"
-                              "steps. F9 adds a color step from\nthe pixel under the cursor. Waits go\n"
-                              "after the selected step (or at the end).",
-                  foreground="#777", justify="left").grid(row=5, column=0, columnspan=2,
-                                                         sticky="w", pady=(6, 0))
+        w = ttk.Button(wait_row, text="Add wait", command=self.add_wait)
+        w.grid(row=0, column=4, sticky="ew")
+        self._tip("Insert a wait after the selected step (or at the end). It replaces the normal "
+                  "delay between steps there.", w)
+        edit_row = ttk.Frame(right)
+        edit_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 2))
+        edit_row.columnconfigure((2, 3), weight=1)
+        for col, text, command, tip in (
+                (0, "▲", lambda: self.move_selected(-1), "Move the selected steps up (Ctrl+↑ in the list)."),
+                (1, "▼", lambda: self.move_selected(1), "Move the selected steps down (Ctrl+↓ in the list)."),
+                (2, "Remove", self.remove_selected, "Remove the selected steps."),
+                (3, "Clear", self.clear_steps, "Remove all steps.")):
+            w = ttk.Button(edit_row, text=text, command=command, width=3 if col < 2 else 7)
+            w.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 2, 0 if col == 3 else 2))
+            self._tip(tip, w)
+        for col, text, command, tip in (
+                (0, "Save…", self.save, "Save the steps, idle areas and all settings to a file."),
+                (1, "Load…", self.load, "Load steps, idle areas and settings from a saved file.")):
+            w = ttk.Button(right, text=text, command=command)
+            w.grid(row=4, column=col, sticky="ew", padx=(0, 2) if col == 0 else (2, 0), pady=(0, 2))
+            self._tip(tip, w)
+
+        self._build_idle_tab(idle_tab)
 
         self.status_var = tk.StringVar()
-        ttk.Label(frm, textvariable=self.status_var, foreground="#555").grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(frm, textvariable=self.status_var, foreground="#555", wraplength=680).grid(
+            row=1, column=0, sticky="w", pady=(6, 0))  # wraps rather than widening the window
 
         if self.hotkeys.failed:
             taken = ", ".join(key_name(vk) for vk in self.hotkeys.failed)
             self.show_note(f"{taken} already claimed by another program; they'll also reach the focused app", 8)
+        else:
+            self.show_note("Tip: rest the mouse on any setting or button for an explanation", 6)
         self.tick()
+
+    def _tip(self, text, *widgets):
+        for w in widgets:
+            Tooltip(w, text)
+
+    def _bool(self, key, default):
+        var = tk.BooleanVar(value=default)
+        self.bool_vars[key] = var
+        return var
+
+    def _field_rows(self, box, fields):
+        """Label + entry rows for numeric settings, with their tooltips."""
+        box.columnconfigure(0, weight=1)
+        for row, (key, label, default) in enumerate(fields):
+            lbl = ttk.Label(box, text=label)
+            lbl.grid(row=row, column=0, sticky="w", pady=2)
+            var = tk.StringVar(value=str(default))
+            entry = ttk.Entry(box, textvariable=var, width=8)
+            entry.grid(row=row, column=1, pady=2, padx=(6, 0))
+            self.vars[key] = var
+            if key in self.TIPS:
+                self._tip(self.TIPS[key], lbl, entry)
+
+    def _build_idle_tab(self, tab):
+        left = ttk.Frame(tab)
+        left.grid(row=0, column=0, sticky="n")
+        right = ttk.LabelFrame(tab, text="Idle areas", padding=6)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+
+        w = ttk.Checkbutton(left, text="Idle at these areas when there's free time",
+                            variable=self._bool("idle", True))
+        w.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._tip("While waiting for the next step, wander to a random idle area and drift around "
+                  "it. Idling never delays a step: it only starts when there's time to get there, "
+                  "hover for the minimum time, and still be back on schedule.", w)
+        when = ttk.LabelFrame(left, text="Idle during", padding=(8, 4))
+        when.grid(row=1, column=0, sticky="ew", pady=3)
+        for row, (key, label, default, tip) in enumerate((
+                ("idle_in_delays", "Delays between steps", True, "The normal delay between steps."),
+                ("idle_in_waits", "Wait steps", True, "Wait steps in the sequence."),
+                ("idle_in_breaks", "Breaks", False, "Random breaks. Off by default, so breaks keep the mouse still."))):
+            w = ttk.Checkbutton(when, text=label, variable=self._bool(key, default))
+            w.grid(row=row, column=0, sticky="w")
+            self._tip(tip, w)
+        hover = ttk.LabelFrame(left, text="Hovering", padding=(8, 4))
+        hover.grid(row=2, column=0, sticky="ew", pady=3)
+        self._field_rows(hover, self.IDLE_FIELDS)
+
+        self.idle_tree = ttk.Treeview(right, columns=("n", "spot", "r", "click"), show="headings",
+                                      height=12, selectmode="extended")
+        for col, title, width in (("n", "#", 32), ("spot", "Idle spot", 100),
+                                  ("r", "Radius", 60), ("click", "Click spot", 100)):
+            self.idle_tree.heading(col, text=title)
+            self.idle_tree.column(col, width=width, anchor="center", stretch=False)
+        self.idle_tree.tag_configure("current", background=self.CURRENT_BG)
+        self.idle_tree.grid(row=0, column=0, columnspan=3, sticky="nsew")
+        self.idle_tree.bind("<<TreeviewSelect>>", self._on_idle_select)
+        self._tip("Idle areas. The highlighted one is being hovered right now. Areas with a click "
+                  "spot get clicked there first, then idled around the idle spot. Select areas to "
+                  "see or change their settings.", self.idle_tree)
+
+        opts = ttk.Frame(right)
+        opts.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 4))
+        lbl = ttk.Label(opts, text="Hover radius (px)")
+        lbl.grid(row=0, column=0)
+        self.area_radius_var = tk.StringVar(value="40")
+        entry = ttk.Entry(opts, textvariable=self.area_radius_var, width=6)
+        entry.grid(row=0, column=1, padx=(4, 12))
+        self._tip("How far from its idle spot the cursor drifts.", lbl, entry)
+        self.area_click_var = tk.BooleanVar(value=False)
+        self.area_click_var.trace_add("write", self._on_area_click_toggle)
+        w = ttk.Checkbutton(opts, text="Click before idling", variable=self.area_click_var)
+        w.grid(row=0, column=2)
+        self._tip("Click somewhere first, then go and idle at the area. With this ticked, adding an "
+                  "area takes two F8 presses: first over the spot to click, then over the spot to "
+                  "idle around.", w)
+        right.columnconfigure((0, 1, 2), weight=1)
+        for col, text, command, tip in (
+                (0, "Apply to selected", self.apply_to_areas,
+                 "Give the selected areas the hover radius above. Unticking 'Click before idling' "
+                 "removes their click spot."),
+                (1, "Remove", self.remove_areas, "Remove the selected areas."),
+                (2, "Clear", self.clear_areas, "Remove all idle areas.")):
+            w = ttk.Button(right, text=text, command=command)
+            w.grid(row=2, column=col, sticky="ew", padx=(0 if col == 0 else 2, 0 if col == 2 else 2))
+            self._tip(tip, w)
+        ttk.Label(right, text="F8 adds an area at the mouse (with this tab open).",
+                  foreground="#777").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def show_note(self, text, seconds=4):
         self.note, self.note_until = text, time.monotonic() + seconds
@@ -917,10 +1367,11 @@ class App:
                 s[key] = max(0, int(float(self.vars[key].get())))
             except ValueError:
                 s[key] = self.clicker.settings.get(key, default)  # keep last good value while typing
-        s["breaks"] = self.breaks_var.get()
-        s["stop_on_move"] = self.stop_on_move_var.get()
+        for key, var in self.bool_vars.items():
+            s[key] = var.get()
         s["mode"] = self.mode_var.get()
         s["steps"] = tuple(self.steps)
+        s["idle_areas"] = tuple(self.idle_areas)
         return s
 
     def set_anchor(self):
@@ -964,10 +1415,11 @@ class App:
         if not path:
             return
         settings = self.read_settings()
-        del settings["steps"]
+        del settings["steps"], settings["idle_areas"]
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "settings": settings, "steps": self.steps}, f, indent=1)
+                json.dump({"version": 1, "settings": settings, "steps": self.steps,
+                           "idle_areas": self.idle_areas}, f, indent=1)
         except OSError as e:
             self.show_note(f"Couldn't save: {e.strerror or e}")
             return
@@ -982,6 +1434,9 @@ class App:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             steps = [parse_step(st) for st in data.get("steps", [])]
+            # Files saved before idle areas existed keep the current ones.
+            areas = ([parse_idle_area(a) for a in data["idle_areas"]] if "idle_areas" in data
+                     else self.idle_areas)
             settings = data.get("settings", {})
             for key, _, _ in self.FIELDS:
                 if key in settings:
@@ -992,14 +1447,96 @@ class App:
         for key, var in self.vars.items():
             if key in settings:
                 var.set(str(settings[key]))
-        for key, var in (("breaks", self.breaks_var), ("stop_on_move", self.stop_on_move_var)):
+        for key, var in self.bool_vars.items():
             if key in settings:
                 var.set(bool(settings[key]))
         if settings.get("mode") in ("anchor", "sequence"):
             self.mode_var.set(settings["mode"])
         self.steps = steps
+        self.idle_areas = areas
         self._refresh_list()
-        self.show_note(f"Loaded {os.path.basename(path)} ({len(steps)} steps)")
+        self._refresh_idle_tree()
+        self.show_note(f"Loaded {os.path.basename(path)} ({len(steps)} steps, {len(areas)} idle areas)")
+
+    def add_idle_area(self):
+        """F8 on the Idle tab. With 'Click before idling' ticked, the first press saves the click
+        spot and the second sets the idle spot; otherwise one press adds a plain area."""
+        opts = self._area_options()
+        if not opts:
+            return
+        radius, click = opts
+        x, y = cursor_pos()
+        if click and self._pending_click is None:
+            self._pending_click = (x, y)
+            return
+        self.idle_areas.append({"x": x, "y": y, "radius": radius,
+                                "click": self._pending_click if click else None})
+        self._pending_click = None
+        self._refresh_idle_tree()
+        self.idle_tree.see(str(len(self.idle_areas) - 1))
+
+    def _on_area_click_toggle(self, *_):
+        if not self.area_click_var.get():
+            self._pending_click = None  # unticking cancels a half-made area
+
+    def _area_options(self):
+        try:
+            return max(0, int(float(self.area_radius_var.get()))), self.area_click_var.get()
+        except ValueError:
+            self.show_note("Hover radius must be a number")
+            return None
+
+    def apply_to_areas(self):
+        sel = [int(i) for i in self.idle_tree.selection()]
+        if not sel:
+            self.show_note("Select the areas to change first")
+            return
+        opts = self._area_options()
+        if not opts:
+            return
+        radius, click = opts
+        missing = 0
+        for i in sel:
+            area = self.idle_areas[i]
+            missing += click and not area["click"]
+            self.idle_areas[i] = {**area, "radius": radius, "click": area["click"] if click else None}
+        self._refresh_idle_tree()
+        self.idle_tree.selection_set([str(i) for i in sel])
+        if missing:
+            self.show_note(f"{missing} area(s) have no click spot. Re-create to add one: "
+                           "F8 on the click spot, then on the idle spot.", 8)
+
+    def remove_areas(self):
+        for i in sorted((int(i) for i in self.idle_tree.selection()), reverse=True):
+            del self.idle_areas[i]
+        self._refresh_idle_tree()
+
+    def clear_areas(self):
+        self.idle_areas.clear()
+        self._refresh_idle_tree()
+
+    def _refresh_idle_tree(self):
+        self.idle_tree.delete(*self.idle_tree.get_children())
+        for i, a in enumerate(self.idle_areas):
+            click = "%d, %d" % a["click"] if a["click"] else ""
+            self.idle_tree.insert("", "end", iid=str(i), tags=("current",) if i == self._shown_idle else (),
+                                  values=(i + 1, f"{a['x']}, {a['y']}", a["radius"], click))
+
+    def _on_idle_select(self, _event):
+        sel = self.idle_tree.selection()
+        if sel:
+            a = self.idle_areas[int(sel[0])]
+            self.area_radius_var.set(str(a["radius"]))
+            self.area_click_var.set(a["click"] is not None)
+
+    def _update_idle_highlight(self):
+        cur = self.clicker.current_idle if self.clicker.running else None
+        if cur == self._shown_idle:
+            return
+        old, self._shown_idle = self._shown_idle, cur
+        for i in (old, cur):
+            if i is not None and i < len(self.idle_areas):
+                self.idle_tree.item(str(i), tags=("current",) if i == cur else ())
 
     def add_step(self, step):
         self.steps.append(step)
@@ -1047,6 +1584,44 @@ class App:
     def clear_steps(self):
         self.steps.clear()
         self._refresh_list()
+
+    def move_selected(self, delta):
+        """Move the selected steps one place up (-1) or down (+1), keeping them selected."""
+        sel = sorted(int(i) for i in self.listbox.curselection())
+        if not sel:
+            self.show_note("Select the steps to move first")
+            return
+        if sel[0] + delta < 0 or sel[-1] + delta >= len(self.steps):
+            return  # already at the top / bottom
+        for i in (sel if delta < 0 else reversed(sel)):
+            self.steps[i], self.steps[i + delta] = self.steps[i + delta], self.steps[i]
+        self._refresh_list()
+        for i in sel:
+            self.listbox.selection_set(i + delta)
+        self.listbox.see(sel[0] + delta if delta < 0 else sel[-1] + delta)
+
+    def _drag_start(self, event):
+        # Plain press on a step starts a drag; Shift/Ctrl-clicks keep their selection meaning.
+        i = self.listbox.nearest(event.y)
+        plain = not event.state & 0x0005  # neither Shift nor Ctrl held
+        self._drag_from = i if plain and 0 <= i < len(self.steps) else None
+
+    def _drag_motion(self, event):
+        if self._drag_from is None:
+            return None  # let the listbox do its normal drag-select
+        to = self.listbox.nearest(event.y)
+        if 0 <= to < len(self.steps) and to != self._drag_from:
+            self.steps.insert(to, self.steps.pop(self._drag_from))
+            self._drag_from = to
+            self._refresh_list()
+            self.listbox.selection_set(to)
+            self.listbox.see(to)
+            self.listbox.config(cursor="sb_v_double_arrow")
+        return "break"
+
+    def _drag_end(self, _event):
+        self._drag_from = None
+        self.listbox.config(cursor="")
 
     def _refresh_list(self):
         self.listbox.delete(0, "end")
@@ -1155,7 +1730,10 @@ class App:
         if VK_F7 in hits:
             self.toggle_record()
         if VK_F8 in hits:
-            self.set_anchor()
+            if self.notebook.index("current") == 1:
+                self.add_idle_area()
+            else:
+                self.set_anchor()
         if VK_F9 in hits:
             self.add_color_step()
         if VK_F10 in hits:
@@ -1167,8 +1745,11 @@ class App:
                               state="normal" if running else "disabled")
         self.record_btn.config(text="Stop recording (F7)" if self.recording else "Record (F7)")
         self._update_highlight()
+        self._update_idle_highlight()
         if self.recording:
             status = f"Recording: click or type to add, F9 adds color, F7 to finish ({len(self.steps)} steps)"
+        elif self._pending_click:
+            status = "Click spot set at %d, %d. Now hover where it should idle and press F8." % self._pending_click
         elif time.monotonic() < self.note_until:
             status = self.note
         elif self.clicker.paused and not self.clicker.status.startswith("Paused"):
