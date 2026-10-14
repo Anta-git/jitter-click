@@ -41,7 +41,7 @@ import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -1062,8 +1062,8 @@ class Tooltip:
 
 class App:
     TIPS = {
-        "x": "Anchor point for 'Click around anchor' mode. Hover where you want it and press F8.",
-        "y": "Anchor point for 'Click around anchor' mode. Hover where you want it and press F8.",
+        "x": "Anchor point for 'Anchor clicks' mode. Hover where you want it and press F8.",
+        "y": "Anchor point for 'Anchor clicks' mode. Hover where you want it and press F8.",
         "radius": "Clicks land within this many pixels of their target, mostly near the middle. "
                   "Also applies to color steps and idle-area clicks.",
         "interval": "Time from one step to the next (press to press, for clicks).",
@@ -1092,30 +1092,30 @@ class App:
     }
     GROUPS = [
         # title, grid row, grid column, fields: (key, label, default)
-        ("Clicking", 1, 0, [
+        ("Clicking", 0, 0, [
             ("x", "Anchor X", 500),
             ("y", "Anchor Y", 500),
             ("radius", "Click radius (px)", 5),
             ("interval", "Delay between steps (ms)", 1000),
             ("interval_jitter", "Delay jitter ± (ms)", 200),
         ]),
-        ("Keys", 1, 1, [
+        ("Keys", 0, 1, [
             ("key_hold", "Key hold (ms)", 90),
             ("key_hold_jitter", "Key hold jitter ± (ms)", 35),
             ("key_delay", "Delay between keys (ms)", 140),
             ("key_delay_jitter", "Key delay jitter ± (ms)", 60),
         ]),
-        ("Movement", 2, 0, [
+        ("Movement", 1, 0, [
             ("speed", "Move speed (%)", 100),
             ("speed_jitter", "Speed jitter ± (%)", 15),
             ("curve", "Path curve ± (%)", 20),
         ]),
-        ("Color steps", 2, 1, [
+        ("Color steps", 1, 1, [
             ("tolerance", "Tolerance ± (0-255)", 20),
             ("search_radius", "Search radius (px, 0 = all)", 0),
             ("color_timeout", "Wait timeout (ms)", 3000),
         ]),
-        ("Breaks", 3, 0, [
+        ("Breaks", 2, 0, [
             ("break_chance", "Chance per step (%)", 2),
             ("break_ms", "Break length (ms)", 10000),
             ("break_jitter", "Break jitter ± (ms)", 3000),
@@ -1136,13 +1136,16 @@ class App:
         self.hotkeys = Hotkeys(HOTKEYS)
         self.vars = {}
         self.bool_vars = {}
-        self.steps = []              # recorded sequence; see add_step() callers for the shapes
+        self.sequences = {MAIN: []}  # name -> steps; Main plays, the others are sub-sequences
+        self.current_seq = MAIN      # the sequence shown in the step editor
         self.idle_areas = []         # {"x", "y", "radius", "click"}
         self.recording = False
         self.note, self.note_until = "", 0.0   # temporary message for the status line
-        self._shown_step = None      # step index currently highlighted in the list
+        self._shown_step = None      # step index currently highlighted in the step list
+        self._shown_active = frozenset()  # sequences marked ▶ (playing) in the sequence list
         self._shown_idle = None      # idle area currently highlighted
         self._pending_click = None   # click spot captured by the first F8 of a two-press area
+        self._drag_from = None       # step being dragged in the step list
         self._keys_down = set()      # edge detection for polled keys
         self._rec_down = set()       # keys down at the last recording poll
         self._mod_unused = {}        # modifiers held with no other key pressed yet
@@ -1155,119 +1158,38 @@ class App:
         frm.grid()
         self.notebook = ttk.Notebook(frm)
         self.notebook.grid(row=0, column=0, sticky="nsew")
-        seq_tab = ttk.Frame(self.notebook, padding=8)
-        idle_tab = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(seq_tab, text="Sequence")
-        self.notebook.add(idle_tab, text="Idle areas")
-        left = ttk.Frame(seq_tab)
-        left.grid(row=0, column=0, sticky="n")
-        right = ttk.LabelFrame(seq_tab, text="Recorded sequence", padding=6)
-        right.grid(row=0, column=1, sticky="ns", padx=(10, 0))
-
-        self.mode_var = tk.StringVar(value="anchor")
-        modes = ttk.Frame(left)
-        modes.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-        w = ttk.Radiobutton(modes, text="Click around anchor", variable=self.mode_var, value="anchor")
-        w.grid(row=0, column=0, padx=(0, 12))
-        self._tip("Click over and over around the anchor point.", w)
-        w = ttk.Radiobutton(modes, text="Repeat recorded sequence", variable=self.mode_var, value="sequence")
-        w.grid(row=0, column=1)
-        self._tip("Play the recorded steps on the right in a loop.", w)
-
-        groups = {}
-        for title, grow, gcol, fields in self.GROUPS:
-            box = ttk.LabelFrame(left, text=title, padding=(8, 4))
-            box.grid(row=grow, column=gcol, sticky="nsew", padx=3, pady=3)
-            self._field_rows(box, fields)
-            groups[title] = box
-
-        w = ttk.Checkbutton(groups["Breaks"], text="Take random breaks", variable=self._bool("breaks", True))
-        w.grid(row=len(self.GROUPS[-1][3]), column=0, columnspan=2, sticky="w", pady=(2, 0))
-        self._tip("Now and then, stop for a while: no clicks, keys or mouse movement "
-                  "(unless idling during breaks is on in the Idle areas tab).", w)
-
-        controls = ttk.Frame(left, padding=(8, 4))
-        controls.grid(row=3, column=1, sticky="nsew", padx=3, pady=3)
-        controls.columnconfigure((0, 1), weight=1)
-        w = ttk.Checkbutton(controls, text="Stop if I move the mouse", variable=self._bool("stop_on_move", True))
-        w.grid(row=0, column=0, columnspan=2, sticky="w", pady=(4, 8))
-        self._tip("Stop automatically if you take over the mouse (it's more than 3 px from where "
-                  "it was left). Doesn't apply while paused.", w)
-        self.toggle_btn = ttk.Button(controls, text="Start (F6)", command=self.toggle)
-        self.toggle_btn.grid(row=1, column=0, sticky="ew", padx=(0, 3))
-        self._tip("Start or stop (F6). Starting again begins from step 1.", self.toggle_btn)
-        self.pause_btn = ttk.Button(controls, text="Pause (F10)", command=self.toggle_pause)
-        self.pause_btn.grid(row=1, column=1, sticky="ew", padx=(3, 0))
-        self._tip("Pause or resume (F10). Resumes the step it paused on; the mouse is yours "
-                  "while paused.", self.pause_btn)
-        w = ttk.Button(controls, text="Set anchor (F8)", command=self.set_anchor)
-        w.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self._tip("Set the anchor to the mouse position. Hover where you want it and press F8.", w)
-
-        self.listbox = tk.Listbox(right, height=16, width=32, activestyle="none",
-                                  selectmode="extended")
-        self.listbox.grid(row=0, column=0, columnspan=2, sticky="nsew")
-        self._tip("The steps, in order. ▶ marks the one in progress. Drag a step to move it. "
-                  "Select steps to move, remove, or insert a wait after them (Shift/Ctrl-click "
-                  "selects several).", self.listbox)
-        self._drag_from = None
-        self.listbox.bind("<ButtonPress-1>", self._drag_start, add="+")
-        self.listbox.bind("<B1-Motion>", self._drag_motion)
-        self.listbox.bind("<ButtonRelease-1>", self._drag_end, add="+")
-        self.listbox.bind("<Control-Up>", lambda e: self.move_selected(-1) or "break")
-        self.listbox.bind("<Control-Down>", lambda e: self.move_selected(1) or "break")
-        self.record_btn = ttk.Button(right, text="Record (F7)", command=self.toggle_record)
-        self.record_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 2))
-        self._tip("Start or stop recording (F7). Your clicks (and shift-clicks) and key presses on "
-                  "other windows become steps. F9 adds a color step from the pixel under the cursor, "
-                  "recording or not.", self.record_btn)
-        wait_row = ttk.Frame(right)
-        wait_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 2))
-        wait_row.columnconfigure(4, weight=1)
-        self.wait_ms_var = tk.StringVar(value="2000")
-        self.wait_jitter_var = tk.StringVar(value="500")
-        w = ttk.Entry(wait_row, textvariable=self.wait_ms_var, width=6)
-        w.grid(row=0, column=0)
-        self._tip("Length of the wait to add (ms).", w)
-        ttk.Label(wait_row, text="±").grid(row=0, column=1, padx=2)
-        w = ttk.Entry(wait_row, textvariable=self.wait_jitter_var, width=5)
-        w.grid(row=0, column=2)
-        self._tip("Random ± change to the wait each time it plays (ms).", w)
-        ttk.Label(wait_row, text="ms").grid(row=0, column=3, padx=(2, 4))
-        w = ttk.Button(wait_row, text="Add wait", command=self.add_wait)
-        w.grid(row=0, column=4, sticky="ew")
-        self._tip("Insert a wait after the selected step (or at the end). It replaces the normal "
-                  "delay between steps there.", w)
-        edit_row = ttk.Frame(right)
-        edit_row.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 2))
-        edit_row.columnconfigure((2, 3), weight=1)
-        for col, text, command, tip in (
-                (0, "▲", lambda: self.move_selected(-1), "Move the selected steps up (Ctrl+↑ in the list)."),
-                (1, "▼", lambda: self.move_selected(1), "Move the selected steps down (Ctrl+↓ in the list)."),
-                (2, "Remove", self.remove_selected, "Remove the selected steps."),
-                (3, "Clear", self.clear_steps, "Remove all steps.")):
-            w = ttk.Button(edit_row, text=text, command=command, width=3 if col < 2 else 7)
-            w.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 2, 0 if col == 3 else 2))
-            self._tip(tip, w)
-        for col, text, command, tip in (
-                (0, "Save…", self.save, "Save the steps, idle areas and all settings to a file."),
-                (1, "Load…", self.load, "Load steps, idle areas and settings from a saved file.")):
-            w = ttk.Button(right, text=text, command=command)
-            w.grid(row=4, column=col, sticky="ew", padx=(0, 2) if col == 0 else (2, 0), pady=(0, 2))
-            self._tip(tip, w)
-
-        self._build_idle_tab(idle_tab)
+        tabs = {}
+        for name in ("Sequences", "Settings", "Idle areas"):
+            tabs[name] = ttk.Frame(self.notebook, padding=8)
+            self.notebook.add(tabs[name], text=name)
+        self.idle_tab = tabs["Idle areas"]
+        self._build_sequences_tab(tabs["Sequences"])
+        self._build_settings_tab(tabs["Settings"])
+        self._build_idle_tab(self.idle_tab)
+        self._build_bottom_bar(frm)
 
         self.status_var = tk.StringVar()
         ttk.Label(frm, textvariable=self.status_var, foreground="#555", wraplength=680).grid(
-            row=1, column=0, sticky="w", pady=(6, 0))  # wraps rather than widening the window
+            row=2, column=0, sticky="w", pady=(6, 0))  # wraps rather than widening the window
 
+        self._show_sequence(MAIN)
         if self.hotkeys.failed:
             taken = ", ".join(key_name(vk) for vk in self.hotkeys.failed)
             self.show_note(f"{taken} already claimed by another program; they'll also reach the focused app", 8)
         else:
             self.show_note("Tip: rest the mouse on any setting or button for an explanation", 6)
         self.tick()
+
+    @property
+    def steps(self):
+        """Steps of the sequence open in the editor."""
+        return self.sequences[self.current_seq]
+
+    @steps.setter
+    def steps(self, steps):
+        self.sequences[self.current_seq] = list(steps)
+
+    # ---------- layout ----------
 
     def _tip(self, text, *widgets):
         for w in widgets:
@@ -1290,6 +1212,137 @@ class App:
             self.vars[key] = var
             if key in self.TIPS:
                 self._tip(self.TIPS[key], lbl, entry)
+
+    def _build_sequences_tab(self, tab):
+        left = ttk.LabelFrame(tab, text="Sequences", padding=6)
+        left.grid(row=0, column=0, sticky="ns")
+        self.seq_list = tk.Listbox(left, height=18, width=22, activestyle="none", exportselection=False)
+        self.seq_list.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.seq_list.bind("<<ListboxSelect>>", self._on_seq_select)
+        self._tip("Main is what plays, in a loop. The others are sub-sequences: put them in a "
+                  "sequence with a Run step. (n) is the number of steps, ▶ marks sequences playing "
+                  "right now. Select a sequence to see and edit its steps.", self.seq_list)
+        for row, col, text, command, tip in (
+                (1, 0, "New…", self.new_sequence, "Create an empty sub-sequence and open it for editing."),
+                (1, 1, "Rename…", self.rename_sequence,
+                 "Rename the selected sub-sequence. Run steps that use it are updated."),
+                (2, 0, "Duplicate", self.duplicate_sequence, "Copy the selected sequence as a new sub-sequence."),
+                (2, 1, "Delete", self.delete_sequence,
+                 "Delete the selected sub-sequence, along with any Run steps that use it.")):
+            w = ttk.Button(left, text=text, command=command, width=9)
+            w.grid(row=row, column=col, sticky="ew", pady=(6 if row == 1 else 2, 0),
+                   padx=(0, 2) if col == 0 else (2, 0))
+            self._tip(tip, w)
+
+        right = self.steps_frame = ttk.LabelFrame(tab, text="Steps", padding=6)
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        right.columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(right, height=14, width=44, activestyle="none",
+                                  selectmode="extended", exportselection=False)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        self._tip("The steps, in order. ▶ marks the one in progress, ×N means it repeats. Drag a "
+                  "step to move it. Select steps to move, repeat or remove them, or to insert after "
+                  "them (Shift/Ctrl-click selects several).", self.listbox)
+        self.listbox.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.listbox.bind("<B1-Motion>", self._drag_motion)
+        self.listbox.bind("<ButtonRelease-1>", self._drag_end, add="+")
+        self.listbox.bind("<Control-Up>", lambda e: self.move_selected(-1) or "break")
+        self.listbox.bind("<Control-Down>", lambda e: self.move_selected(1) or "break")
+        self.listbox.bind("<<ListboxSelect>>", self._on_step_select)
+
+        self.record_btn = ttk.Button(right, text="Record (F7)", command=self.toggle_record)
+        self.record_btn.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        self._tip("Start or stop recording into the sequence shown (F7). Your clicks (and "
+                  "shift-clicks) and key presses on other windows become steps. F9 adds a color "
+                  "step from the pixel under the cursor, recording or not.", self.record_btn)
+
+        def row_frame(row, label):
+            f = ttk.Frame(right)
+            f.grid(row=row, column=0, sticky="ew", pady=2)
+            ttk.Label(f, text=label, width=7).grid(row=0, column=0, sticky="w")
+            return f
+
+        f = row_frame(2, "Wait")
+        f.columnconfigure(5, weight=1)
+        self.wait_ms_var = tk.StringVar(value="2000")
+        self.wait_jitter_var = tk.StringVar(value="500")
+        w = ttk.Entry(f, textvariable=self.wait_ms_var, width=7)
+        w.grid(row=0, column=1)
+        self._tip("Length of the wait to add (ms).", w)
+        ttk.Label(f, text="±").grid(row=0, column=2, padx=3)
+        w = ttk.Entry(f, textvariable=self.wait_jitter_var, width=6)
+        w.grid(row=0, column=3)
+        self._tip("Random ± change to the wait each time it plays (ms).", w)
+        ttk.Label(f, text="ms").grid(row=0, column=4, padx=(3, 8))
+        w = ttk.Button(f, text="Add wait", command=self.add_wait)
+        w.grid(row=0, column=5, sticky="ew")
+        self._tip("Insert a wait after the selected step (or at the end). It replaces the normal "
+                  "delay between steps there.", w)
+
+        f = row_frame(3, "Run")
+        f.columnconfigure(4, weight=1)
+        self.run_var = tk.StringVar()
+        self.run_combo = ttk.Combobox(f, textvariable=self.run_var, width=14, state="readonly",
+                                      postcommand=self._update_run_choices)
+        self.run_combo.grid(row=0, column=1)
+        self._tip("The sub-sequence to run. Ones that would end up running this sequence again "
+                  "(a loop) aren't offered.", self.run_combo)
+        ttk.Label(f, text="×").grid(row=0, column=2, padx=3)
+        self.run_times_var = tk.StringVar(value="1")
+        w = ttk.Entry(f, textvariable=self.run_times_var, width=5)
+        w.grid(row=0, column=3, padx=(0, 8))
+        self._tip("How many times to run it in a row.", w)
+        w = ttk.Button(f, text="Add run", command=self.add_run)
+        w.grid(row=0, column=4, sticky="ew")
+        self._tip("Insert a step that plays the chosen sub-sequence, after the selected step "
+                  "(or at the end).", w)
+
+        f = row_frame(4, "Repeat")
+        f.columnconfigure(3, weight=1)
+        ttk.Label(f, text="selected ×").grid(row=0, column=1, padx=(0, 3))
+        self.repeat_var = tk.StringVar(value="1")
+        w = ttk.Entry(f, textvariable=self.repeat_var, width=5)
+        w.grid(row=0, column=2, padx=(0, 8))
+        self._tip("How many times each selected step plays in a row. Selecting a single step "
+                  "shows its count.", w)
+        w = ttk.Button(f, text="Set repeats", command=self.set_repeats)
+        w.grid(row=0, column=3, sticky="ew")
+        self._tip("Give the selected steps this repeat count (1 = play once).", w)
+
+        f = ttk.Frame(right)
+        f.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        f.columnconfigure((2, 3), weight=1)
+        for col, text, command, tip in (
+                (0, "▲", lambda: self.move_selected(-1), "Move the selected steps up (Ctrl+↑ in the list)."),
+                (1, "▼", lambda: self.move_selected(1), "Move the selected steps down (Ctrl+↓ in the list)."),
+                (2, "Remove", self.remove_selected, "Remove the selected steps."),
+                (3, "Clear", self.clear_steps, "Remove all steps from this sequence.")):
+            w = ttk.Button(f, text=text, command=command, width=3 if col < 2 else 7)
+            w.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 2, 0 if col == 3 else 2))
+            self._tip(tip, w)
+
+    def _build_settings_tab(self, tab):
+        groups = {}
+        for title, grow, gcol, fields in self.GROUPS:
+            box = ttk.LabelFrame(tab, text=title, padding=(8, 4))
+            box.grid(row=grow, column=gcol, sticky="nsew", padx=3, pady=3)
+            self._field_rows(box, fields)
+            groups[title] = box
+        w = ttk.Checkbutton(groups["Breaks"], text="Take random breaks", variable=self._bool("breaks", True))
+        w.grid(row=len(self.GROUPS[-1][3]), column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._tip("Now and then, stop for a while: no clicks, keys or mouse movement "
+                  "(unless idling during breaks is on in the Idle areas tab).", w)
+
+        other = ttk.LabelFrame(tab, text="Control", padding=(8, 4))
+        other.grid(row=2, column=1, sticky="nsew", padx=3, pady=3)
+        other.columnconfigure(0, weight=1)
+        w = ttk.Checkbutton(other, text="Stop if I move the mouse", variable=self._bool("stop_on_move", True))
+        w.grid(row=0, column=0, sticky="w", pady=(2, 8))
+        self._tip("Stop automatically if you take over the mouse (it's more than 3 px from where "
+                  "it was left). Doesn't apply while paused.", w)
+        w = ttk.Button(other, text="Set anchor (F8)", command=self.set_anchor)
+        w.grid(row=1, column=0, sticky="ew")
+        self._tip("Set the anchor to the mouse position. Hover where you want it and press F8.", w)
 
     def _build_idle_tab(self, tab):
         left = ttk.Frame(tab)
@@ -1357,6 +1410,35 @@ class App:
         ttk.Label(right, text="F8 adds an area at the mouse (with this tab open).",
                   foreground="#777").grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+    def _build_bottom_bar(self, frm):
+        bar = ttk.Frame(frm)
+        bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        bar.columnconfigure(3, weight=1)
+        ttk.Label(bar, text="Play:").grid(row=0, column=0, padx=(0, 6))
+        self.mode_var = tk.StringVar(value="sequence")
+        w = ttk.Radiobutton(bar, text="Main sequence", variable=self.mode_var, value="sequence")
+        w.grid(row=0, column=1, padx=(0, 10))
+        self._tip("Play the Main sequence in a loop (sub-sequences play where Main runs them).", w)
+        w = ttk.Radiobutton(bar, text="Anchor clicks", variable=self.mode_var, value="anchor")
+        w.grid(row=0, column=2)
+        self._tip("Ignore the sequences and click over and over around the anchor point "
+                  "(set on the Settings tab).", w)
+        self.toggle_btn = ttk.Button(bar, text="Start (F6)", command=self.toggle)
+        self.toggle_btn.grid(row=0, column=4, padx=2)
+        self._tip("Start or stop (F6). Starting again begins from the top of Main.", self.toggle_btn)
+        self.pause_btn = ttk.Button(bar, text="Pause (F10)", command=self.toggle_pause)
+        self.pause_btn.grid(row=0, column=5, padx=2)
+        self._tip("Pause or resume (F10). Resumes the step it paused on, even inside a "
+                  "sub-sequence; the mouse is yours while paused.", self.pause_btn)
+        for col, text, command, tip in (
+                (6, "Save…", self.save, "Save all sequences, idle areas and settings to a file."),
+                (7, "Load…", self.load, "Load sequences, idle areas and settings from a saved file.")):
+            w = ttk.Button(bar, text=text, command=command, width=7)
+            w.grid(row=0, column=col, padx=(8 if col == 6 else 2, 0))
+            self._tip(tip, w)
+
+    # ---------- settings, start/stop ----------
+
     def show_note(self, text, seconds=4):
         self.note, self.note_until = text, time.monotonic() + seconds
 
@@ -1370,7 +1452,7 @@ class App:
         for key, var in self.bool_vars.items():
             s[key] = var.get()
         s["mode"] = self.mode_var.get()
-        s["steps"] = tuple(self.steps)
+        s["sequences"] = {name: tuple(steps) for name, steps in self.sequences.items()}
         s["idle_areas"] = tuple(self.idle_areas)
         return s
 
@@ -1385,8 +1467,8 @@ class App:
             self.clicker.stop()
             return
         self.recording = False
-        if self.mode_var.get() == "sequence" and not self.steps:
-            self.show_note("Record or load a sequence first")
+        if self.mode_var.get() == "sequence" and not self.sequences[MAIN]:
+            self.show_note("Main has no steps yet: record some, or add a Run step for a sub-sequence")
             return
         self.clicker.settings = self.read_settings()
         self.clicker.start()
@@ -1403,6 +1485,7 @@ class App:
         self.recording = not self.recording
         if self.recording:
             self.mode_var.set("sequence")
+            self.notebook.select(0)
             # Keys already held when recording starts aren't recorded.
             self._rec_down = {vk for vk in RECORDABLE_KEYS if user32.GetAsyncKeyState(vk) & 0x8000}
             self._mod_unused = {}
@@ -1415,10 +1498,10 @@ class App:
         if not path:
             return
         settings = self.read_settings()
-        del settings["steps"], settings["idle_areas"]
+        del settings["sequences"], settings["idle_areas"]
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"version": 1, "settings": settings, "steps": self.steps,
+                json.dump({"version": 2, "settings": settings, "sequences": self.sequences,
                            "idle_areas": self.idle_areas}, f, indent=1)
         except OSError as e:
             self.show_note(f"Couldn't save: {e.strerror or e}")
@@ -1433,7 +1516,14 @@ class App:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            steps = [parse_step(st) for st in data.get("steps", [])]
+            if "sequences" in data:
+                seqs = {str(name): [parse_step(st) for st in steps]
+                        for name, steps in data["sequences"].items()}
+                if MAIN not in seqs:
+                    raise ValueError(f"no {MAIN} sequence")
+                seqs = {MAIN: seqs.pop(MAIN), **seqs}
+            else:  # saved before sub-sequences existed: its steps are Main
+                seqs = {MAIN: [parse_step(st) for st in data.get("steps", [])]}
             # Files saved before idle areas existed keep the current ones.
             areas = ([parse_idle_area(a) for a in data["idle_areas"]] if "idle_areas" in data
                      else self.idle_areas)
@@ -1452,11 +1542,299 @@ class App:
                 var.set(bool(settings[key]))
         if settings.get("mode") in ("anchor", "sequence"):
             self.mode_var.set(settings["mode"])
-        self.steps = steps
+        self.sequences = seqs
         self.idle_areas = areas
-        self._refresh_list()
+        self._show_sequence(MAIN)
         self._refresh_idle_tree()
-        self.show_note(f"Loaded {os.path.basename(path)} ({len(steps)} steps, {len(areas)} idle areas)")
+        n_steps = sum(len(v) for v in seqs.values())
+        self.show_note(f"Loaded {os.path.basename(path)} ({len(seqs)} sequence(s), {n_steps} steps, "
+                       f"{len(areas)} idle areas)")
+
+    # ---------- sequences ----------
+
+    def _show_sequence(self, name):
+        """Open a sequence in the step editor."""
+        self.current_seq = name
+        self._shown_step = None
+        self.steps_frame.config(text=f"Steps in {name}" + ("  (plays in a loop)" if name == MAIN else ""))
+        self.run_var.set("")
+        self._refresh_list()
+        self.listbox.see(0)
+
+    def _on_seq_select(self, _event):
+        sel = self.seq_list.curselection()
+        if sel:
+            name = list(self.sequences)[int(sel[0])]
+            if name != self.current_seq:
+                self._show_sequence(name)
+
+    def _refresh_seq_list(self):
+        self.seq_list.delete(0, "end")
+        for name, steps in self.sequences.items():
+            mark = "▶ " if name in self._shown_active else "    "
+            self.seq_list.insert("end", f"{mark}{name}  ({len(steps)})")
+        i = list(self.sequences).index(self.current_seq)
+        self.seq_list.selection_set(i)
+        self.seq_list.see(i)
+
+    def _ask_name(self, title, prompt, initial="", keep=None):
+        """Ask for a sequence name; None if cancelled or not usable. `keep` is a name that may be
+        reused (the one being renamed)."""
+        name = simpledialog.askstring(title, prompt, initialvalue=initial, parent=self.root)
+        if name is None:
+            return None
+        name = name.strip()
+        if not name:
+            self.show_note("A sequence needs a name")
+        elif len(name) > 30:
+            self.show_note("Keep names to 30 characters or fewer")
+        elif name != keep and name in self.sequences:
+            self.show_note(f"There's already a sequence called {name}")
+        else:
+            return name
+        return None
+
+    def new_sequence(self):
+        name = self._ask_name("New sub-sequence", "Name for the new sub-sequence:")
+        if name:
+            self.sequences[name] = []
+            self._show_sequence(name)
+
+    def duplicate_sequence(self):
+        base = f"{self.current_seq} copy"
+        name, n = base, 2
+        while name in self.sequences:
+            name, n = f"{base} {n}", n + 1
+        self.sequences[name] = [dict(st) for st in self.steps]
+        self._show_sequence(name)
+
+    def rename_sequence(self):
+        old = self.current_seq
+        if old == MAIN:
+            self.show_note(f"{MAIN} can't be renamed; it's the sequence that plays")
+            return
+        new = self._ask_name("Rename sub-sequence", f"New name for {old}:", old, keep=old)
+        if not new or new == old:
+            return
+        self.sequences = {
+            (new if name == old else name):
+                [{**st, "seq": new} if st["type"] == "call" and st["seq"] == old else st for st in steps]
+            for name, steps in self.sequences.items()}
+        self._show_sequence(new)
+
+    def delete_sequence(self):
+        name = self.current_seq
+        if name == MAIN:
+            self.show_note(f"{MAIN} can't be deleted (Clear empties it)")
+            return
+        uses = sum(st["type"] == "call" and st["seq"] == name
+                   for steps in self.sequences.values() for st in steps)
+        if self.steps or uses:
+            msg = f"Delete {name} and its {len(self.steps)} step(s)?"
+            if uses:
+                msg += f"\n\nIt's run by {uses} Run step(s), which will be removed too."
+            if not messagebox.askyesno("Delete sub-sequence", msg, parent=self.root):
+                return
+        del self.sequences[name]
+        for other, steps in self.sequences.items():
+            self.sequences[other] = [st for st in steps if not (st["type"] == "call" and st["seq"] == name)]
+        self._show_sequence(MAIN)
+
+    def _update_run_choices(self):
+        """Sub-sequences that can be run from the open sequence without ever running it again."""
+        cur = self.current_seq
+        self.run_combo["values"] = [n for n in self.sequences
+                                    if n != MAIN and not runs_into(self.sequences, n, cur)]
+
+    # ---------- steps ----------
+
+    def _times(self, var):
+        try:
+            times = int(float(var.get()))
+        except ValueError:
+            times = 0
+        if not 1 <= times <= 100000:
+            self.show_note("Repeat counts must be a whole number from 1 up")
+            return None
+        return times
+
+    def _insert_step(self, step):
+        """Insert after the selected step (or at the end) and select it, so repeated adds chain."""
+        sel = self.listbox.curselection()
+        i = int(sel[-1]) + 1 if sel else len(self.steps)
+        self.steps.insert(i, step)
+        self.mode_var.set("sequence")
+        self._refresh_list()
+        self.listbox.selection_set(i)
+        self.listbox.see(i)
+
+    def add_step(self, step):
+        self.steps.append(step)
+        self.mode_var.set("sequence")
+        self._refresh_list()
+        self.listbox.see("end")
+
+    def add_color_step(self):
+        x, y = cursor_pos()
+        self.add_step({"type": "color", "x": x, "y": y, "rgb": pixel_color(x, y)})
+
+    def add_wait(self):
+        try:
+            ms = max(0, int(float(self.wait_ms_var.get())))
+            jitter = max(0, int(float(self.wait_jitter_var.get())))
+        except ValueError:
+            self.show_note("Wait time and jitter must be numbers")
+            return
+        self._insert_step({"type": "wait", "ms": ms, "jitter": jitter})
+
+    def add_run(self):
+        name = self.run_var.get()
+        if not name:
+            self.show_note("Pick a sub-sequence to run first (create one with New…)")
+            return
+        if name not in self.sequences or name == MAIN or runs_into(self.sequences, name, self.current_seq):
+            self.show_note(f"{name} can't be run from {self.current_seq}: it would end up running itself")
+            return
+        times = self._times(self.run_times_var)
+        if times:
+            self._insert_step({"type": "call", "seq": name, **({"times": times} if times > 1 else {})})
+
+    def set_repeats(self):
+        sel = [int(i) for i in self.listbox.curselection()]
+        if not sel:
+            self.show_note("Select the steps to repeat first")
+            return
+        times = self._times(self.repeat_var)
+        if not times:
+            return
+        for i in sel:
+            st = {k: v for k, v in self.steps[i].items() if k != "times"}
+            if times > 1:
+                st["times"] = times
+            self.steps[i] = st
+        self._refresh_list()
+        for i in sel:
+            self.listbox.selection_set(i)
+
+    def _on_step_select(self, _event):
+        sel = self.listbox.curselection()
+        if len(sel) == 1:
+            self.repeat_var.set(str(self.steps[int(sel[0])].get("times", 1)))
+
+    def add_key(self, combo):
+        """Record a key press. Presses within 2 s of each other join one 'type' step."""
+        now = time.perf_counter()
+        last = self.steps[-1] if self.steps else None
+        if last and last["type"] == "keys" and "times" not in last and now - self._last_key_time < 2.0:
+            self.steps[-1] = {"type": "keys", "keys": last["keys"] + (combo,)}
+            self._render_item(len(self.steps) - 1)
+            self.listbox.see("end")
+        else:
+            self.add_step({"type": "keys", "keys": (combo,)})
+        self._last_key_time = now
+
+    def remove_selected(self):
+        for i in sorted(self.listbox.curselection(), reverse=True):
+            del self.steps[int(i)]
+        self._refresh_list()
+
+    def clear_steps(self):
+        self.steps.clear()
+        self._refresh_list()
+
+    def move_selected(self, delta):
+        """Move the selected steps one place up (-1) or down (+1), keeping them selected."""
+        sel = sorted(int(i) for i in self.listbox.curselection())
+        if not sel:
+            self.show_note("Select the steps to move first")
+            return
+        if sel[0] + delta < 0 or sel[-1] + delta >= len(self.steps):
+            return  # already at the top / bottom
+        for i in (sel if delta < 0 else reversed(sel)):
+            self.steps[i], self.steps[i + delta] = self.steps[i + delta], self.steps[i]
+        self._refresh_list()
+        for i in sel:
+            self.listbox.selection_set(i + delta)
+        self.listbox.see(sel[0] + delta if delta < 0 else sel[-1] + delta)
+
+    def _drag_start(self, event):
+        # Plain press on a step starts a drag; Shift/Ctrl-clicks keep their selection meaning.
+        i = self.listbox.nearest(event.y)
+        plain = not event.state & 0x0005  # neither Shift nor Ctrl held
+        self._drag_from = i if plain and 0 <= i < len(self.steps) else None
+
+    def _drag_motion(self, event):
+        if self._drag_from is None:
+            return None  # let the listbox do its normal drag-select
+        to = self.listbox.nearest(event.y)
+        if 0 <= to < len(self.steps) and to != self._drag_from:
+            self.steps.insert(to, self.steps.pop(self._drag_from))
+            self._drag_from = to
+            self._refresh_list()
+            self.listbox.selection_set(to)
+            self.listbox.see(to)
+            self.listbox.config(cursor="sb_v_double_arrow")
+        return "break"
+
+    def _drag_end(self, _event):
+        self._drag_from = None
+        self.listbox.config(cursor="")
+
+    def _refresh_list(self):
+        self.listbox.delete(0, "end")
+        for i in range(len(self.steps)):
+            self._render_item(i, replace=False)
+        self._refresh_seq_list()  # step counts
+
+    def _render_item(self, i, replace=True):
+        """(Re)draw step row i, marking it if it's the step in progress."""
+        st = self.steps[i]
+        current = i == self._shown_step
+        selected = replace and self.listbox.selection_includes(i)
+        if st["type"] == "color":
+            text = f"find color {color_hex(st['rgb'])}"
+        elif st["type"] == "keys":
+            text = keys_label(st["keys"])
+            text = text if len(text) <= 30 else text[:29] + "…"
+        elif st["type"] == "wait":
+            text = f"wait  {fmt_ms(st['ms'])}" + (f" ± {fmt_ms(st['jitter'])}" if st["jitter"] else "")
+        elif st["type"] == "call":
+            text = f"run  {st['seq']}" + ("" if st["seq"] in self.sequences else "  (missing)")
+        else:
+            text = f"{'shift-click' if st.get('shift') else 'click'}  ({st['x']}, {st['y']})"
+        if st.get("times", 1) > 1:
+            text += f"  ×{st['times']}"
+        if replace:
+            self.listbox.delete(i)
+        self.listbox.insert(i, ("▶ " if current else "    ") + f"{i + 1}.  {text}")
+        if st["type"] == "color":
+            r, g, b = st["rgb"]
+            light = 0.299 * r + 0.587 * g + 0.114 * b > 140
+            self.listbox.itemconfig(i, background=color_hex(st["rgb"]),
+                                    foreground="black" if light else "white")
+        elif current:
+            self.listbox.itemconfig(i, background=self.CURRENT_BG)
+        if selected:
+            self.listbox.selection_set(i)
+
+    def _update_highlight(self):
+        """Mark the playing step in the open sequence, and the playing sequences in the list."""
+        stack = self.clicker.stack if self.clicker.running else ()
+        active = frozenset(name for name, _ in stack)
+        if active != self._shown_active:
+            self._shown_active = active
+            self._refresh_seq_list()
+        cur = next((idx for name, idx in reversed(stack) if name == self.current_seq), None)
+        if cur == self._shown_step:
+            return
+        old, self._shown_step = self._shown_step, cur
+        for i in (old, cur):
+            if i is not None and i < len(self.steps):
+                self._render_item(i)
+        if cur is not None and cur < len(self.steps):
+            self.listbox.see(cur)
+
+    # ---------- idle areas ----------
 
     def add_idle_area(self):
         """F8 on the Idle tab. With 'Click before idling' ticked, the first press saves the click
@@ -1538,133 +1916,7 @@ class App:
             if i is not None and i < len(self.idle_areas):
                 self.idle_tree.item(str(i), tags=("current",) if i == cur else ())
 
-    def add_step(self, step):
-        self.steps.append(step)
-        self.mode_var.set("sequence")
-        self._refresh_list()
-        self.listbox.see("end")
-
-    def add_color_step(self):
-        x, y = cursor_pos()
-        self.add_step({"type": "color", "x": x, "y": y, "rgb": pixel_color(x, y)})
-
-    def add_wait(self):
-        """Insert a wait step after the selected step, or at the end if nothing is selected."""
-        try:
-            ms = max(0, int(float(self.wait_ms_var.get())))
-            jitter = max(0, int(float(self.wait_jitter_var.get())))
-        except ValueError:
-            self.show_note("Wait time and jitter must be numbers")
-            return
-        sel = self.listbox.curselection()
-        i = int(sel[-1]) + 1 if sel else len(self.steps)
-        self.steps.insert(i, {"type": "wait", "ms": ms, "jitter": jitter})
-        self.mode_var.set("sequence")
-        self._refresh_list()
-        self.listbox.selection_set(i)  # so repeated adds chain in order
-        self.listbox.see(i)
-
-    def add_key(self, combo):
-        """Record a key press. Presses within 2 s of each other join one 'type' step."""
-        now = time.perf_counter()
-        last = self.steps[-1] if self.steps else None
-        if last and last["type"] == "keys" and now - self._last_key_time < 2.0:
-            self.steps[-1] = {"type": "keys", "keys": last["keys"] + (combo,)}
-            self._render_item(len(self.steps) - 1)
-            self.listbox.see("end")
-        else:
-            self.add_step({"type": "keys", "keys": (combo,)})
-        self._last_key_time = now
-
-    def remove_selected(self):
-        for i in sorted(self.listbox.curselection(), reverse=True):
-            del self.steps[int(i)]
-        self._refresh_list()
-
-    def clear_steps(self):
-        self.steps.clear()
-        self._refresh_list()
-
-    def move_selected(self, delta):
-        """Move the selected steps one place up (-1) or down (+1), keeping them selected."""
-        sel = sorted(int(i) for i in self.listbox.curselection())
-        if not sel:
-            self.show_note("Select the steps to move first")
-            return
-        if sel[0] + delta < 0 or sel[-1] + delta >= len(self.steps):
-            return  # already at the top / bottom
-        for i in (sel if delta < 0 else reversed(sel)):
-            self.steps[i], self.steps[i + delta] = self.steps[i + delta], self.steps[i]
-        self._refresh_list()
-        for i in sel:
-            self.listbox.selection_set(i + delta)
-        self.listbox.see(sel[0] + delta if delta < 0 else sel[-1] + delta)
-
-    def _drag_start(self, event):
-        # Plain press on a step starts a drag; Shift/Ctrl-clicks keep their selection meaning.
-        i = self.listbox.nearest(event.y)
-        plain = not event.state & 0x0005  # neither Shift nor Ctrl held
-        self._drag_from = i if plain and 0 <= i < len(self.steps) else None
-
-    def _drag_motion(self, event):
-        if self._drag_from is None:
-            return None  # let the listbox do its normal drag-select
-        to = self.listbox.nearest(event.y)
-        if 0 <= to < len(self.steps) and to != self._drag_from:
-            self.steps.insert(to, self.steps.pop(self._drag_from))
-            self._drag_from = to
-            self._refresh_list()
-            self.listbox.selection_set(to)
-            self.listbox.see(to)
-            self.listbox.config(cursor="sb_v_double_arrow")
-        return "break"
-
-    def _drag_end(self, _event):
-        self._drag_from = None
-        self.listbox.config(cursor="")
-
-    def _refresh_list(self):
-        self.listbox.delete(0, "end")
-        for i in range(len(self.steps)):
-            self._render_item(i, replace=False)
-
-    def _render_item(self, i, replace=True):
-        """(Re)draw list row i, marking it if it's the step in progress."""
-        st = self.steps[i]
-        current = i == self._shown_step
-        selected = replace and self.listbox.selection_includes(i)
-        if st["type"] == "color":
-            text = f"find color {color_hex(st['rgb'])}"
-        elif st["type"] == "keys":
-            text = keys_label(st["keys"])
-            text = text if len(text) <= 30 else text[:29] + "…"
-        elif st["type"] == "wait":
-            text = f"wait  {fmt_ms(st['ms'])}" + (f" ± {fmt_ms(st['jitter'])}" if st["jitter"] else "")
-        else:
-            text = f"{'shift-click' if st.get('shift') else 'click'}  ({st['x']}, {st['y']})"
-        if replace:
-            self.listbox.delete(i)
-        self.listbox.insert(i, ("▶ " if current else "    ") + f"{i + 1}.  {text}")
-        if st["type"] == "color":
-            r, g, b = st["rgb"]
-            light = 0.299 * r + 0.587 * g + 0.114 * b > 140
-            self.listbox.itemconfig(i, background=color_hex(st["rgb"]),
-                                    foreground="black" if light else "white")
-        elif current:
-            self.listbox.itemconfig(i, background=self.CURRENT_BG)
-        if selected:
-            self.listbox.selection_set(i)
-
-    def _update_highlight(self):
-        cur = self.clicker.current_step if self.clicker.running else None
-        if cur == self._shown_step:
-            return
-        old, self._shown_step = self._shown_step, cur
-        for i in (old, cur):
-            if i is not None and i < len(self.steps):
-                self._render_item(i)
-        if cur is not None and cur < len(self.steps):
-            self.listbox.see(cur)
+    # ---------- recording, hotkeys, polling ----------
 
     def _own_root(self):
         return user32.GetAncestor(self.root.winfo_id(), GA_ROOT)
@@ -1730,7 +1982,7 @@ class App:
         if VK_F7 in hits:
             self.toggle_record()
         if VK_F8 in hits:
-            if self.notebook.index("current") == 1:
+            if self.notebook.select() == str(self.idle_tab):
                 self.add_idle_area()
             else:
                 self.set_anchor()
@@ -1747,7 +1999,8 @@ class App:
         self._update_highlight()
         self._update_idle_highlight()
         if self.recording:
-            status = f"Recording: click or type to add, F9 adds color, F7 to finish ({len(self.steps)} steps)"
+            status = (f"Recording into {self.current_seq}: click or type to add, F9 adds color, "
+                      f"F7 to finish ({len(self.steps)} steps)")
         elif self._pending_click:
             status = "Click spot set at %d, %d. Now hover where it should idle and press F8." % self._pending_click
         elif time.monotonic() < self.note_until:
