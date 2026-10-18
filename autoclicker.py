@@ -5,7 +5,7 @@ Two modes:
     Sequence  - play the "Main" sequence in a loop. A step is a click at a recorded point
                 (a shift-click if Shift was held), a color step (find that color on screen, move
                 to it, click), a key step (a key, a combo like Ctrl+S, or a run of typed keys),
-                a wait (a set time ± jitter, used instead of the normal delay between steps), or
+                a wait (a set time + jitter, used instead of the normal delay between steps), or
                 a "run" step that plays another named sequence (a sub-sequence). Any step can
                 repeat a set number of times, so "run Loot ×5" plays the Loot sub-sequence five
                 times. Sub-sequences can run other sub-sequences, but never themselves.
@@ -316,12 +316,13 @@ def truncated_gauss(mean, sd, lo, hi):
 
 
 def bell_jitter(base, jitter):
-    """base ± jitter: bell-shaped around base, never outside the range."""
-    return truncated_gauss(base, jitter / 2, base - jitter, base + jitter)
+    """base + up to `jitter`, never below base or above base + jitter. Most values land near
+    the base and longer ones get rarer (a half bell), like human timing."""
+    return base + abs(truncated_gauss(0.0, jitter / 2, -jitter, jitter))
 
 
 def human_delay(base_ms, jitter_ms, minimum_ms=1):
-    """base ± jitter ms, returned in seconds."""
+    """base + up to jitter ms (never less than base), returned in seconds."""
     return max(minimum_ms, bell_jitter(base_ms, jitter_ms)) / 1000.0
 
 
@@ -344,16 +345,15 @@ def movement_time(dist, speed_pct, speed_jitter_pct):
     if dist < 1:
         return 0.0
     t = 0.05 + 0.11 * math.log2(dist / 14 + 1)
-    t *= bell_jitter(1.0, min(speed_jitter_pct, 90) / 100)
-    return t * 100 / max(10, speed_pct)
+    # Speed is a minimum: jitter only ever makes a move faster.
+    return t * 100 / max(10, bell_jitter(speed_pct, speed_pct * speed_jitter_pct / 100))
 
 
 def max_movement_time(dist, speed_pct, speed_jitter_pct):
     """Upper bound on how long movement_time() can make a move of `dist` px."""
     if dist < 1:
         return 0.0
-    return ((0.05 + 0.11 * math.log2(dist / 14 + 1)) * (1 + min(speed_jitter_pct, 90) / 100)
-            * 100 / max(10, speed_pct)) + 0.02
+    return (0.05 + 0.11 * math.log2(dist / 14 + 1)) * 100 / max(10, speed_pct) + 0.02
 
 
 def point_in_circle(cx, cy, r):
@@ -381,7 +381,7 @@ def point_in_zone(cx, cy, r, near=None, hop=None):
 
 
 def curved_path(x0, y0, x1, y1, curve_pct):
-    """Cubic Bezier from start to end that bows to one side by up to ±curve_pct of the distance.
+    """Cubic Bezier from start to end that bows to a random side by up to curve_pct of the distance.
 
     Returns (p, normal): p(s) gives the point at progress s in [0, 1]; normal is the unit
     vector perpendicular to the straight line.
@@ -389,7 +389,7 @@ def curved_path(x0, y0, x1, y1, curve_pct):
     dx, dy = x1 - x0, y1 - y0
     dist = math.hypot(dx, dy)
     nx, ny = -dy / dist, dx / dist
-    bend = bell_jitter(0.0, curve_pct / 100) * min(dist, 600)
+    bend = bell_jitter(0.0, curve_pct / 100) * random.choice((-1, 1)) * min(dist, 600)
     a1, a2 = random.uniform(0.2, 0.4), random.uniform(0.6, 0.8)
     b1, b2 = bend * random.uniform(0.6, 1.2), bend * random.uniform(0.6, 1.2)
     c1x, c1y = x0 + dx * a1 + nx * b1, y0 + dy * a1 + ny * b1
@@ -403,14 +403,15 @@ def curved_path(x0, y0, x1, y1, curve_pct):
     return p, (nx, ny)
 
 
-def key_timeline(combos, hold_ms, hold_jitter, delay_ms, delay_jitter):
+def key_timeline(combos, hold_ms, hold_jitter, delay_ms, delay_jitter, delays=None):
     """Plan typing `combos` (each (modifier_vks, vk)) like a person.
 
-    Returns time-sorted (seconds, vk, is_up) events. Each key is held for hold ± jitter; each key
-    goes down delay ± jitter after the previous one, so when the delay is shorter than the hold,
+    Returns time-sorted (seconds, vk, is_up) events. Each key is held for hold + up to jitter; each
+    key goes down delay + up to jitter after the previous one, so when the delay is shorter than the hold,
     consecutive keys overlap the way fast typing does. Combos and lone modifiers never overlap
     with anything (that would change what gets typed): modifiers go down one after another,
-    the key is pressed, then they're released in reverse.
+    the key is pressed, then they're released in reverse. `delays` (ms, one per gap between
+    keys) replaces delay_ms as the base when the step's timing was recorded.
     """
     events = []
     t = 0.0           # when the next key goes down
@@ -420,7 +421,7 @@ def key_timeline(combos, hold_ms, hold_jitter, delay_ms, delay_jitter):
     def hold():
         return human_delay(hold_ms, hold_jitter, 20)
 
-    for mods, vk in combos:
+    for i, (mods, vk) in enumerate(combos):
         t = max(t, barrier, released.get(vk, -1.0) + 0.015)
         if mods or vk in MODIFIERS:
             t = max([t] + [at + random.uniform(0.02, 0.05) for at, _, up in events if up])
@@ -437,7 +438,8 @@ def key_timeline(combos, hold_ms, hold_jitter, delay_ms, delay_jitter):
             down = t
             events += [(down, vk, False), (down + hold(), vk, True)]
         released[vk] = max(at for at, k, up in events if k == vk and up)
-        t = down + human_delay(delay_ms, delay_jitter, 20)
+        base = delays[i] if delays and i < len(delays) else delay_ms
+        t = down + human_delay(base, delay_jitter, 20)
     return sorted(events, key=lambda e: e[0])
 
 
@@ -499,12 +501,16 @@ def parse_step(st):
         if not keys or any(m not in MODIFIERS for mods, _ in keys for m in mods):
             raise ValueError("bad key step")
         step = {"type": "keys", "keys": keys}
+        if "delays" in st:
+            step["delays"] = [max(0, int(d)) for d in st["delays"]]
     elif kind == "wait":
         step = {"type": "wait", "ms": max(0, int(st["ms"])), "jitter": max(0, int(st["jitter"]))}
     elif kind == "call":
         step = {"type": "call", "seq": str(st["seq"])}
     else:
         raise ValueError(f"unknown step type {kind!r}")
+    if "gap" in st:
+        step["gap"] = max(0, int(st["gap"]))
     times = int(st.get("times", 1))
     if times < 1:
         raise ValueError("repeat count must be at least 1")
@@ -624,6 +630,8 @@ class Clicker:
         # repetition of that run step.
         stack = []
         played = False  # whether this pass through Main did anything
+        last_done = None   # when the previous step's action happened
+        after_wait = False  # previous step was a wait (it already set the timing)
         while not self._stop.is_set():
             s = self.settings
             is_wait = False
@@ -663,6 +671,9 @@ class Clicker:
                         continue
                     self.stack = tuple((name, idx) for name, idx, _ in stack)
                     is_wait = st["type"] == "wait"
+                    if "gap" in st and s.get("use_gaps", True) and last_done is not None and not after_wait:
+                        # Recorded timing: the gap you left is the base delay, jitter adds on top.
+                        next_action = last_done + human_delay(st["gap"], s["interval_jitter"], 0)
                     done = self._run_step(st, self._path(stack, seqs), next_action)
                     played = True
             except _Paused:
@@ -676,6 +687,7 @@ class Clicker:
                 stack[-1][2] += 1
             if done is False:
                 continue  # step skipped
+            last_done, after_wait = done, is_wait
             if is_wait:
                 next_action = done  # the wait stood in for the delay; no break chance either
                 continue
@@ -721,9 +733,9 @@ class Clicker:
                 x0, y0 = cursor_pos()
                 if not self._move_to(*home, self._move_time(math.hypot(home[0] - x0, home[1] - y0))):
                     return None
-            if not (self._wait(next_action - time.perf_counter()) and self._type(st["keys"])):
+            if not (self._wait(next_action - time.perf_counter()) and self._type(st["keys"], st.get("delays"))):
                 return None
-            return time.perf_counter()
+            return self._last_key_down  # gaps are measured press to press
         if st["type"] == "color":
             # Search right before we'd start moving, so the position is fresh.
             x0, y0 = cursor_pos()
@@ -744,7 +756,7 @@ class Clicker:
                                     why=f"next: {label}")
 
     def _wait_step(self, st, label):
-        """Wait for the step's time ± jitter (hovering at an idle area if enabled), counting
+        """Wait for the step's time + jitter (hovering at an idle area if enabled), counting
         down in the status. A pause freezes the countdown; resuming continues with the time
         that was left. Returns the end time, or None if stopped."""
         end = time.perf_counter() + human_delay(st["ms"], st["jitter"], 0)
@@ -823,12 +835,13 @@ class Clicker:
             if shift_down:
                 send_key(VK_LSHIFT, up=True)  # also on stop/pause, so Shift is never left held
 
-    def _type(self, combos):
+    def _type(self, combos, delays=None):
         """Play a key step. A pause takes effect at the next moment no key is held, and typing
         resumes from that key. False if stopped partway; any keys still down are released."""
         s = self.settings
         events = key_timeline(combos, s["key_hold"], s["key_hold_jitter"],
-                              s["key_delay"], s["key_delay_jitter"])
+                              s["key_delay"], s["key_delay_jitter"],
+                              delays if s.get("use_gaps", True) else None)
         held = set()
         start = time.perf_counter()
         try:
@@ -845,6 +858,7 @@ class Clicker:
                     held.discard(vk)
                 else:
                     held.add(vk)
+                    self._last_key_down = time.perf_counter()
             self.keys += len(combos)
             return True
         finally:
@@ -933,7 +947,7 @@ class Clicker:
             if time.perf_counter() >= deadline:
                 self.status = f"{color_hex(st['rgb'])} not found, skipped"
                 return None
-            if not self._wait(human_delay(250, 100)):
+            if not self._wait(human_delay(150, 200)):
                 return None
 
     def _move_time(self, dist):
@@ -1067,28 +1081,28 @@ class App:
         "radius": "Clicks land within this many pixels of their target, mostly near the middle. "
                   "Also applies to color steps and idle-area clicks.",
         "interval": "Time from one step to the next (press to press, for clicks).",
-        "interval_jitter": "Random ± change to each delay between steps. Most land near the "
-                           "setting, never outside the range.",
+        "interval_jitter": "Extra random time added to each delay between steps, from 0 up to this. "
+                           "The delay above is the minimum; most land near it.",
         "key_hold": "How long each key is held down.",
-        "key_hold_jitter": "Random ± change to each key's hold time.",
+        "key_hold_jitter": "Extra random hold time, from 0 up to this, on top of the minimum.",
         "key_delay": "Time from one key press to the next inside a key step. Shorter than the "
                      "hold time means keys overlap, like fast typing.",
-        "key_delay_jitter": "Random ± change to the time between keys.",
+        "key_delay_jitter": "Extra random time between keys, from 0 up to this, on top of the minimum.",
         "speed": "Overall mouse speed. 200 moves twice as fast, 50 half as fast.",
-        "speed_jitter": "How much each move's speed varies, ± %.",
-        "curve": "How far paths bow to one side, as ± % of the move's length. 0 = straight lines.",
+        "speed_jitter": "How much faster than the minimum speed a move can be, in %. Never slower.",
+        "curve": "Most a path bows to one side (random side), as % of the move's length. 0 = straight lines.",
         "tolerance": "How far each of red, green and blue may differ from the recorded color and "
                      "still count as a match.",
         "search_radius": "Only search this far around where the color was picked. 0 searches every screen.",
         "color_timeout": "If the color isn't on screen, keep looking this long, then skip the step.",
         "break_chance": "Chance of a break after each click or key step.",
         "break_ms": "How long a break lasts.",
-        "break_jitter": "Random ± change to each break's length.",
+        "break_jitter": "Extra random time, from 0 up to this, added to each break.",
         "idle_min": "Only go idle if the cursor can hover at least this long before it has to "
                     "head back for the next step.",
         "drift_speed": "Speed of the slow drifting moves while idling, as % of the normal move speed.",
         "drift_pause": "Time spent still between drifting moves.",
-        "drift_pause_jitter": "Random ± change to each pause between drifts.",
+        "drift_pause_jitter": "Extra random time, from 0 up to this, added to each pause between drifts.",
     }
     GROUPS = [
         # title, grid row, grid column, fields: (key, label, default)
@@ -1096,19 +1110,19 @@ class App:
             ("x", "Anchor X", 500),
             ("y", "Anchor Y", 500),
             ("radius", "Click radius (px)", 5),
-            ("interval", "Delay between steps (ms)", 1000),
-            ("interval_jitter", "Delay jitter ± (ms)", 200),
+            ("interval", "Min delay between steps (ms)", 800),
+            ("interval_jitter", "Delay jitter + (ms)", 400),
         ]),
         ("Keys", 0, 1, [
-            ("key_hold", "Key hold (ms)", 90),
-            ("key_hold_jitter", "Key hold jitter ± (ms)", 35),
-            ("key_delay", "Delay between keys (ms)", 140),
-            ("key_delay_jitter", "Key delay jitter ± (ms)", 60),
+            ("key_hold", "Min key hold (ms)", 60),
+            ("key_hold_jitter", "Key hold jitter + (ms)", 60),
+            ("key_delay", "Min delay between keys (ms)", 90),
+            ("key_delay_jitter", "Key delay jitter + (ms)", 100),
         ]),
         ("Movement", 1, 0, [
-            ("speed", "Move speed (%)", 100),
-            ("speed_jitter", "Speed jitter ± (%)", 15),
-            ("curve", "Path curve ± (%)", 20),
+            ("speed", "Min move speed (%)", 90),
+            ("speed_jitter", "Speed jitter + (%)", 25),
+            ("curve", "Max path curve (%)", 25),
         ]),
         ("Color steps", 1, 1, [
             ("tolerance", "Tolerance ± (0-255)", 20),
@@ -1117,15 +1131,15 @@ class App:
         ]),
         ("Breaks", 2, 0, [
             ("break_chance", "Chance per step (%)", 2),
-            ("break_ms", "Break length (ms)", 10000),
-            ("break_jitter", "Break jitter ± (ms)", 3000),
+            ("break_ms", "Min break length (ms)", 7000),
+            ("break_jitter", "Break jitter + (ms)", 6000),
         ]),
     ]
     IDLE_FIELDS = [
         ("idle_min", "Min hover time (ms)", 1500),
         ("drift_speed", "Drift speed (%)", 35),
-        ("drift_pause", "Pause between drifts (ms)", 900),
-        ("drift_pause_jitter", "Drift pause jitter ± (ms)", 600),
+        ("drift_pause", "Min pause between drifts (ms)", 400),
+        ("drift_pause_jitter", "Drift pause jitter + (ms)", 1000),
     ]
     FIELDS = [f for group in GROUPS for f in group[3]] + IDLE_FIELDS
     CURRENT_BG = "#cfe3ff"
@@ -1150,6 +1164,7 @@ class App:
         self._rec_down = set()       # keys down at the last recording poll
         self._mod_unused = {}        # modifiers held with no other key pressed yet
         self._last_key_time = 0.0
+        self._last_action = None     # when the previous recorded action happened (for timing)
 
         root.title("Jitter Clicker")
         root.attributes("-topmost", True)
@@ -1240,7 +1255,7 @@ class App:
         self.listbox = tk.Listbox(right, height=14, width=44, activestyle="none",
                                   selectmode="extended", exportselection=False)
         self.listbox.grid(row=0, column=0, sticky="nsew")
-        self._tip("The steps, in order. ▶ marks the one in progress, ×N means it repeats. Drag a "
+        self._tip("The steps, in order. ▶ marks the one in progress, ×N means it repeats, ⏱ is your recorded delay before it. Drag a "
                   "step to move it. Select steps to move, repeat or remove them, or to insert after "
                   "them (Shift/Ctrl-click selects several).", self.listbox)
         self.listbox.bind("<ButtonPress-1>", self._drag_start, add="+")
@@ -1250,8 +1265,16 @@ class App:
         self.listbox.bind("<Control-Down>", lambda e: self.move_selected(1) or "break")
         self.listbox.bind("<<ListboxSelect>>", self._on_step_select)
 
-        self.record_btn = ttk.Button(right, text="Record (F7)", command=self.toggle_record)
-        self.record_btn.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        rec_row = ttk.Frame(right)
+        rec_row.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        rec_row.columnconfigure(0, weight=1)
+        self.record_btn = ttk.Button(rec_row, text="Record (F7)", command=self.toggle_record)
+        self.record_btn.grid(row=0, column=0, sticky="ew")
+        w = ttk.Checkbutton(rec_row, text="Record my timing", variable=self._bool("record_timing", False))
+        w.grid(row=0, column=1, padx=(8, 0))
+        self._tip("Also record how long you took between clicks and key presses. On playback that "
+                  "time is the base delay before the step (jitter only adds to it), instead of "
+                  "'Min delay between steps'. Typed keys keep your spacing between keys too.", w)
         self._tip("Start or stop recording into the sequence shown (F7). Your clicks (and "
                   "shift-clicks) and key presses on other windows become steps. F9 adds a color "
                   "step from the pixel under the cursor, recording or not.", self.record_btn)
@@ -1264,15 +1287,15 @@ class App:
 
         f = row_frame(2, "Wait")
         f.columnconfigure(5, weight=1)
-        self.wait_ms_var = tk.StringVar(value="2000")
-        self.wait_jitter_var = tk.StringVar(value="500")
+        self.wait_ms_var = tk.StringVar(value="1500")
+        self.wait_jitter_var = tk.StringVar(value="1000")
         w = ttk.Entry(f, textvariable=self.wait_ms_var, width=7)
         w.grid(row=0, column=1)
-        self._tip("Length of the wait to add (ms).", w)
-        ttk.Label(f, text="±").grid(row=0, column=2, padx=3)
+        self._tip("Minimum length of the wait to add (ms).", w)
+        ttk.Label(f, text="+").grid(row=0, column=2, padx=3)
         w = ttk.Entry(f, textvariable=self.wait_jitter_var, width=6)
         w.grid(row=0, column=3)
-        self._tip("Random ± change to the wait each time it plays (ms).", w)
+        self._tip("Extra random time added to the wait each time it plays, from 0 up to this (ms).", w)
         ttk.Label(f, text="ms").grid(row=0, column=4, padx=(3, 8))
         w = ttk.Button(f, text="Add wait", command=self.add_wait)
         w.grid(row=0, column=5, sticky="ew")
@@ -1340,8 +1363,12 @@ class App:
         w.grid(row=0, column=0, sticky="w", pady=(2, 8))
         self._tip("Stop automatically if you take over the mouse (it's more than 3 px from where "
                   "it was left). Doesn't apply while paused.", w)
+        w = ttk.Checkbutton(other, text="Use recorded timing", variable=self._bool("use_gaps", True))
+        w.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self._tip("Steps recorded with 'Record my timing' wait the time you took (plus jitter). "
+                  "Untick to give every step the normal delay instead.", w)
         w = ttk.Button(other, text="Set anchor (F8)", command=self.set_anchor)
-        w.grid(row=1, column=0, sticky="ew")
+        w.grid(row=2, column=0, sticky="ew")
         self._tip("Set the anchor to the mouse position. Hover where you want it and press F8.", w)
 
     def _build_idle_tab(self, tab):
@@ -1490,6 +1517,7 @@ class App:
             self._rec_down = {vk for vk in RECORDABLE_KEYS if user32.GetAsyncKeyState(vk) & 0x8000}
             self._mod_unused = {}
             self._last_key_time = 0.0
+            self._last_action = None
 
     def save(self):
         path = filedialog.asksaveasfilename(parent=self.root, title="Save pattern",
@@ -1674,9 +1702,19 @@ class App:
         self._refresh_list()
         self.listbox.see("end")
 
+    def _timed(self, step):
+        """While recording with 'Record my timing', stamp the step with the time since the
+        previous recorded action (ms)."""
+        if self.recording and self.bool_vars["record_timing"].get():
+            now = time.perf_counter()
+            if self._last_action is not None:
+                step["gap"] = round((now - self._last_action) * 1000)
+            self._last_action = now
+        return step
+
     def add_color_step(self):
         x, y = cursor_pos()
-        self.add_step({"type": "color", "x": x, "y": y, "rgb": pixel_color(x, y)})
+        self.add_step(self._timed({"type": "color", "x": x, "y": y, "rgb": pixel_color(x, y)}))
 
     def add_wait(self):
         try:
@@ -1726,11 +1764,17 @@ class App:
         now = time.perf_counter()
         last = self.steps[-1] if self.steps else None
         if last and last["type"] == "keys" and "times" not in last and now - self._last_key_time < 2.0:
-            self.steps[-1] = {"type": "keys", "keys": last["keys"] + (combo,)}
+            step = {**last, "keys": last["keys"] + (combo,)}
+            delays = last.get("delays", [])
+            if (self.bool_vars["record_timing"].get() and self._last_action is not None
+                    and len(delays) == len(last["keys"]) - 1):
+                step["delays"] = delays + [round((now - self._last_action) * 1000)]
+                self._last_action = now
+            self.steps[-1] = step
             self._render_item(len(self.steps) - 1)
             self.listbox.see("end")
         else:
-            self.add_step({"type": "keys", "keys": (combo,)})
+            self.add_step(self._timed({"type": "keys", "keys": (combo,)}))
         self._last_key_time = now
 
     def remove_selected(self):
@@ -1797,13 +1841,15 @@ class App:
             text = keys_label(st["keys"])
             text = text if len(text) <= 30 else text[:29] + "…"
         elif st["type"] == "wait":
-            text = f"wait  {fmt_ms(st['ms'])}" + (f" ± {fmt_ms(st['jitter'])}" if st["jitter"] else "")
+            text = f"wait  {fmt_ms(st['ms'])}" + (f" + {fmt_ms(st['jitter'])}" if st["jitter"] else "")
         elif st["type"] == "call":
             text = f"run  {st['seq']}" + ("" if st["seq"] in self.sequences else "  (missing)")
         else:
             text = f"{'shift-click' if st.get('shift') else 'click'}  ({st['x']}, {st['y']})"
         if st.get("times", 1) > 1:
             text += f"  ×{st['times']}"
+        if "gap" in st:
+            text += f"  ⏱ {fmt_ms(st['gap'])}"
         if replace:
             self.listbox.delete(i)
         self.listbox.insert(i, ("▶ " if current else "    ") + f"{i + 1}.  {text}")
@@ -1969,7 +2015,8 @@ class App:
                     if vk in self._mod_unused:
                         self._mod_unused[vk] = False  # Shift was used for this click, not a lone tap
                 if not self._is_own_window(x, y):
-                    self.add_step({"type": "click", "x": x, "y": y, **({"shift": True} if shift else {})})
+                    self.add_step(self._timed({"type": "click", "x": x, "y": y,
+                                               **({"shift": True} if shift else {})}))
 
         hits = set()
         while not self.hotkeys.pressed.empty():
