@@ -108,7 +108,7 @@ and results never go below the minimum. Most values land near the minimum; longe
 | **Keys** | Min key hold, key hold jitter, min delay between keys, key delay jitter |
 | **Movement** | Min move speed, speed jitter (only ever faster), max path curve |
 | **Color steps** | Tolerance (± per R/G/B channel), search radius (0 = all screens), wait timeout |
-| **Breaks** | Take random breaks; chance per step, min break length, break jitter |
+| **Breaks** | Take random breaks; break chance, min break length, break jitter. By default the chance is rolled after every step; tick **Only at the end of Main** to roll it once per loop, just before Main starts over (anchor clicks still roll per click) |
 | **Control** | Stop if I move the mouse, use recorded timing, set anchor |
 
 ### How input looks natural

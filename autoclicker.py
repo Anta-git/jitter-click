@@ -656,6 +656,12 @@ class Clicker:
                             break
                         else:
                             played = False  # Main starts over
+                            if s["breaks"] and s.get("break_at_end"):
+                                took = self._maybe_break(s)
+                                if took is None:
+                                    break
+                                if took:
+                                    next_action = time.perf_counter()
                         continue
                     st = steps[frame[1]]
                     if frame[2] >= st.get("times", 1):
@@ -693,18 +699,30 @@ class Clicker:
                 continue
             next_action = done + human_delay(s["interval"], s["interval_jitter"])
 
-            if s["breaks"] and random.random() * 100 < s["break_chance"]:
-                dur = human_delay(s["break_ms"], s["break_jitter"])
-                self.status = f"On break ({dur:.1f}s)"
-                end = time.perf_counter() + dur
-                try:
-                    if not (self._idle(end, "breaks", why="on break")
-                            and self._wait(end - time.perf_counter())):
-                        break
-                except _Paused:
-                    if self._hold_while_paused() is None:  # resuming ends the break
-                        break
-                next_action = time.perf_counter()
+            # Breaks after a step, unless they're set to happen only when Main loops (anchor
+            # mode has no loop end, so it always rolls per click).
+            if s["breaks"] and not (s.get("break_at_end") and s["mode"] == "sequence"):
+                took = self._maybe_break(s)
+                if took is None:
+                    break
+                if took:
+                    next_action = time.perf_counter()
+
+    def _maybe_break(self, s):
+        """Roll the break chance and take a break if it hits. Returns True if a break was
+        taken, False if not, None if stopped during it."""
+        if random.random() * 100 >= s["break_chance"]:
+            return False
+        dur = human_delay(s["break_ms"], s["break_jitter"])
+        self.status = f"On break ({dur:.1f}s)"
+        end = time.perf_counter() + dur
+        try:
+            if not (self._idle(end, "breaks", why="on break") and self._wait(end - time.perf_counter())):
+                return None
+        except _Paused:
+            if self._hold_while_paused() is None:  # resuming ends the break
+                return None
+        return True
 
     @staticmethod
     def _path(stack, seqs):
@@ -1095,7 +1113,8 @@ class App:
                      "still count as a match.",
         "search_radius": "Only search this far around where the color was picked. 0 searches every screen.",
         "color_timeout": "If the color isn't on screen, keep looking this long, then skip the step.",
-        "break_chance": "Chance of a break after each click or key step.",
+        "break_chance": "Chance of a break after each click or key step, or each time Main "
+                        "loops if 'Only at the end of Main' is ticked.",
         "break_ms": "How long a break lasts.",
         "break_jitter": "Extra random time, from 0 up to this, added to each break.",
         "idle_min": "Only go idle if the cursor can hover at least this long before it has to "
@@ -1130,7 +1149,7 @@ class App:
             ("color_timeout", "Wait timeout (ms)", 3000),
         ]),
         ("Breaks", 2, 0, [
-            ("break_chance", "Chance per step (%)", 2),
+            ("break_chance", "Break chance (%)", 2),
             ("break_ms", "Min break length (ms)", 7000),
             ("break_jitter", "Break jitter + (ms)", 6000),
         ]),
@@ -1355,6 +1374,11 @@ class App:
         w.grid(row=len(self.GROUPS[-1][3]), column=0, columnspan=2, sticky="w", pady=(2, 0))
         self._tip("Now and then, stop for a while: no clicks, keys or mouse movement "
                   "(unless idling during breaks is on in the Idle areas tab).", w)
+        w = ttk.Checkbutton(groups["Breaks"], text="Only at the end of Main",
+                            variable=self._bool("break_at_end", False))
+        w.grid(row=len(self.GROUPS[-1][3]) + 1, column=0, columnspan=2, sticky="w")
+        self._tip("Roll the break chance once each time Main finishes, just before it loops, "
+                  "instead of after every step. Anchor clicks still roll after each click.", w)
 
         other = ttk.LabelFrame(tab, text="Control", padding=(8, 4))
         other.grid(row=2, column=1, sticky="nsew", padx=3, pady=3)
